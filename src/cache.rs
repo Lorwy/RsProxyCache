@@ -8,7 +8,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::SystemTime,
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -55,12 +55,24 @@ impl Entry {
         self.record.span.end - self.record.span.start
     }
 
-    pub fn open(&self, span: &Range<u64>) -> Result<(File, u64)> {
+    fn open(&self, span: &Range<u64>) -> Result<(File, u64)> {
         let file = File::open(&self.path)?;
+        if !self.retired.load(Ordering::Acquire) {
+            fs::metadata(self.path.with_extension("json"))?;
+        }
+        ensure!(
+            file.metadata()?.len() == self.size(),
+            "invalid cache file length"
+        );
+        Ok((file, span.start - self.record.span.start))
+    }
+
+    pub fn touch(&self, file: &File) {
         let now = SystemTime::now();
         *self.used.lock().unwrap() = now;
-        let _ = file.set_modified(now);
-        Ok((file, span.start - self.record.span.start))
+        if let Err(error) = file.set_modified(now) {
+            cache_warning("update_interval_access_time", &error);
+        }
     }
 }
 
@@ -81,7 +93,6 @@ pub struct Cache {
     dir: PathBuf,
     capacity: u64,
     index: Mutex<Index>,
-    _lock: File,
 }
 
 #[derive(Default)]
@@ -92,42 +103,60 @@ struct Index {
     versions: HashMap<String, Weak<CacheVersion>>,
     next_version: u64,
     retired: Vec<(Weak<Entry>, u64)>,
+    lease: Option<DirectoryLease>,
+    generation: u64,
 }
 
 struct Reservation {
     cache: Arc<Cache>,
     size: u64,
+    generation: u64,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.cache.index.lock().unwrap().reserved -= self.size;
+        let mut index = self.cache.index.lock().unwrap();
+        if self.generation == index.generation {
+            index.reserved -= self.size;
+        }
     }
 }
 
 impl Cache {
     pub fn open(dir: PathBuf, capacity: u64) -> Result<Arc<Self>> {
-        fs::create_dir_all(&dir)?;
-        let lock = File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(".lock"))?;
-        lock.try_lock().context("cache directory already in use")?;
-        let mut index = Index::default();
-        for item in fs::read_dir(&dir)? {
+        let index = Self::load_index(&dir, capacity)?;
+        tracing::debug!(
+            intervals = index.entries.values().map(Vec::len).sum::<usize>(),
+            bytes = index.size,
+            "cache opened"
+        );
+        Ok(Arc::new(Self {
+            dir,
+            capacity,
+            index: Mutex::new(index),
+        }))
+    }
+
+    fn load_index(dir: &Path, capacity: u64) -> Result<Index> {
+        let lease = DirectoryLease::acquire(dir)?;
+        let mut index = Index {
+            lease: Some(lease),
+            ..Index::default()
+        };
+        for item in fs::read_dir(dir)? {
             let path = item?.path();
             if path.extension().is_some_and(|ext| ext == "json") && owned(&path) {
-                if let Ok(entry) = load(&path) {
-                    index.insert(entry);
-                } else {
-                    remove(&path);
-                    remove(&path.with_extension("data"));
+                match load(&path) {
+                    Ok(entry) => index.insert(entry),
+                    Err(_) => {
+                        cache_warning("load_interval", &"invalid or unreadable cache record");
+                        remove(&path);
+                        remove(&path.with_extension("data"));
+                    }
                 }
             }
         }
-        for item in fs::read_dir(&dir)? {
+        for item in fs::read_dir(dir)? {
             let path = item?.path();
             if (owned(&path)
                 && path.extension().is_some_and(|ext| ext == "data")
@@ -140,22 +169,73 @@ impl Cache {
             }
         }
         index.evict(capacity);
-        Ok(Arc::new(Self {
-            dir,
-            capacity,
-            index: Mutex::new(index),
-            _lock: lock,
-        }))
+        Ok(index)
+    }
+
+    pub fn refresh(&self) -> u64 {
+        let mut index = self.index.lock().unwrap();
+        self.refresh_index(&mut index);
+        index.generation
+    }
+
+    fn refresh_index(&self, index: &mut Index) -> bool {
+        if index
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.is_current(&self.dir))
+        {
+            return true;
+        }
+        if index.lease.is_some() {
+            tracing::warn!("cache directory ownership lost");
+            index.reset();
+        }
+        match Self::load_index(&self.dir, self.capacity) {
+            Ok(mut recovered) => {
+                recovered.next_version = index.next_version;
+                recovered.generation = index.generation + 1;
+                *index = recovered;
+                tracing::info!("cache directory recovered");
+                true
+            }
+            Err(error) => {
+                cache_warning("recover_directory", &format_args!("{error:#}"));
+                false
+            }
+        }
+    }
+
+    pub fn open_entry(&self, entry: &Arc<Entry>, span: &Range<u64>) -> Result<(File, u64)> {
+        entry.open(span).inspect_err(|error| {
+            cache_warning("read_interval", error);
+            let mut index = self.index.lock().unwrap();
+            if !self.refresh_index(&mut index) {
+                return;
+            }
+            let key = &entry.record.key;
+            if let Some(entries) = index.entries.get_mut(key)
+                && let Some(position) = entries
+                    .iter()
+                    .position(|indexed| Arc::ptr_eq(indexed, entry))
+            {
+                let entry = entries.swap_remove(position);
+                if entries.is_empty() {
+                    index.entries.remove(key);
+                }
+                entry.retired.store(true, Ordering::Release);
+                remove(&entry.path.with_extension("json"));
+                index.retired.push((Arc::downgrade(&entry), entry.size()));
+            }
+        })
     }
 
     pub fn metadata(&self, key: &str) -> Option<Metadata> {
-        self.index
-            .lock()
-            .unwrap()
-            .entries
-            .get(key)?
-            .last()
-            .map(|entry| entry.record.metadata.clone())
+        loop {
+            let entry = self.index.lock().unwrap().entries.get(key)?.last()?.clone();
+            if self.open_entry(&entry, &entry.record.span).is_ok() {
+                return Some(entry.record.metadata.clone());
+            }
+        }
     }
 
     pub fn plan(&self, key: &str, span: Range<u64>, metadata: &Metadata) -> Vec<Piece> {
@@ -214,11 +294,14 @@ impl Cache {
         pieces
     }
 
-    fn reserve(self: &Arc<Self>, size: u64) -> Option<Reservation> {
+    fn reserve(self: &Arc<Self>, size: u64, version: &CacheVersion) -> Option<Reservation> {
         if size == 0 || size > self.capacity {
             return None;
         }
         let mut index = self.index.lock().unwrap();
+        if !self.refresh_index(&mut index) || !index.is_current(version) {
+            return None;
+        }
         let remaining = self
             .capacity
             .checked_sub(size.checked_add(index.reserved)?)?;
@@ -230,6 +313,7 @@ impl Cache {
         Some(Reservation {
             cache: self.clone(),
             size,
+            generation: index.generation,
         })
     }
 
@@ -265,18 +349,31 @@ impl Cache {
         }
     }
 
-    fn stage(&self) -> Result<tempfile::NamedTempFile> {
+    fn stage(&self, version: &CacheVersion) -> Result<Option<tempfile::NamedTempFile>> {
+        let mut index = self.index.lock().unwrap();
+        if !self.refresh_index(&mut index) || !index.is_current(version) {
+            return Ok(None);
+        }
         Ok(tempfile::Builder::new()
             .prefix(".rpc-stage-")
-            .tempfile_in(&self.dir)?)
+            .tempfile_in(&self.dir)
+            .map(Some)?)
     }
 
-    pub fn adopt(&self, key: &str, metadata: Metadata) -> Arc<CacheVersion> {
+    pub fn adopt(
+        &self,
+        key: &str,
+        metadata: Metadata,
+        generation: u64,
+    ) -> Option<Arc<CacheVersion>> {
         let mut index = self.index.lock().unwrap();
+        if !self.refresh_index(&mut index) || index.generation != generation {
+            return None;
+        }
         if let Some(active) = index.active(key)
             && active.metadata == metadata
         {
-            return active;
+            return Some(active);
         }
         if index
             .entries
@@ -286,7 +383,7 @@ impl Cache {
         {
             index.clear(key);
         }
-        index.set_version(key, metadata)
+        Some(index.set_version(key, metadata))
     }
 
     pub fn version_for_patch(&self, key: &str, metadata: &Metadata) -> Option<Arc<CacheVersion>> {
@@ -300,6 +397,7 @@ impl Cache {
 
     pub fn clear(&self, key: &str) {
         self.index.lock().unwrap().clear(key);
+        tracing::info!(cache_key = key, "cache cleared");
     }
 }
 
@@ -329,12 +427,14 @@ impl Reservation {
             "staged length mismatch"
         );
         stage.as_file().sync_data()?;
-        let mut sidecar = self.cache.stage()?;
+        let Some(mut sidecar) = self.cache.stage(&version)? else {
+            return Ok(());
+        };
         serde_json::to_writer(&mut sidecar, &record)?;
         sidecar.flush()?;
         sidecar.as_file().sync_data()?;
         let mut index = self.cache.index.lock().unwrap();
-        if !index.is_current(&version) {
+        if !self.cache.refresh_index(&mut index) || !index.is_current(&version) {
             return Ok(());
         }
         stage.persist_noclobber(&path)?;
@@ -344,6 +444,11 @@ impl Reservation {
         }
         index.reserved -= self.size;
         self.size = 0;
+        tracing::debug!(
+            start = record.span.start,
+            end_exclusive = record.span.end,
+            "cache interval published"
+        );
         index.insert(Entry {
             record,
             path,
@@ -355,13 +460,21 @@ impl Reservation {
 }
 
 impl Index {
+    fn reset(&mut self) {
+        *self = Self {
+            next_version: self.next_version,
+            generation: self.generation + 1,
+            ..Self::default()
+        };
+    }
+
     fn active(&self, key: &str) -> Option<Arc<CacheVersion>> {
         self.versions.get(key)?.upgrade()
     }
 
-    fn is_current(&self, version: &Arc<CacheVersion>) -> bool {
+    fn is_current(&self, version: &CacheVersion) -> bool {
         self.active(&version.key)
-            .is_some_and(|active| Arc::ptr_eq(&active, version))
+            .is_some_and(|active| std::ptr::eq(active.as_ref(), version))
     }
 
     fn set_version(&mut self, key: &str, metadata: Metadata) -> Arc<CacheVersion> {
@@ -381,8 +494,8 @@ impl Index {
     fn clear(&mut self, key: &str) {
         self.versions.remove(key);
         for entry in self.entries.remove(key).unwrap_or_default() {
+            entry.retired.store(true, Ordering::Release);
             remove(&entry.path.with_extension("json"));
-            entry.retired.store(true, Ordering::Relaxed);
             self.retired.push((Arc::downgrade(&entry), entry.size()));
         }
     }
@@ -428,6 +541,7 @@ impl Index {
             self.size -= size;
             paths.insert(path);
         }
+        tracing::debug!(intervals = paths.len(), "cache intervals evicted");
         self.entries.retain(|_, entries| {
             entries.retain(|entry| {
                 if paths.contains(&entry.path) {
@@ -480,7 +594,7 @@ fn remove(path: &Path) {
     if let Err(error) = fs::remove_file(path)
         && error.kind() != std::io::ErrorKind::NotFound
     {
-        eprintln!("cache cleanup failed: {error}");
+        cache_warning("remove_file", &error);
     }
 }
 
@@ -499,12 +613,14 @@ impl IntervalWriter {
         while !data.is_empty() {
             if self.next == self.chunk_end {
                 self.chunk_end = self.next.saturating_add(self.chunk_size).min(self.end);
-                self.chunk = StagedInterval::new(&self.cache, self.next..self.chunk_end);
+                self.chunk =
+                    StagedInterval::new(&self.cache, self.next..self.chunk_end, &self.version);
             }
             let size = (self.chunk_end - self.next).min(data.len() as u64) as usize;
             if let Some(chunk) = &mut self.chunk
-                && chunk.file.write_all(&data[..size]).await.is_err()
+                && let Err(error) = chunk.file.write_all(&data[..size]).await
             {
+                cache_warning("write_interval", &error);
                 self.chunk = None;
             }
             self.next += size as u64;
@@ -533,10 +649,18 @@ struct StagedInterval {
 }
 
 impl StagedInterval {
-    fn new(cache: &Arc<Cache>, span: Range<u64>) -> Option<Self> {
-        let reservation = cache.reserve(span.end - span.start)?;
-        let stage = cache.stage().ok()?;
-        let file = AsyncFile::from_std(stage.reopen().ok()?);
+    fn new(cache: &Arc<Cache>, span: Range<u64>, version: &CacheVersion) -> Option<Self> {
+        let reservation = cache.reserve(span.end - span.start, version)?;
+        let stage = cache
+            .stage(version)
+            .inspect_err(|error| cache_warning("stage_interval", error))
+            .ok()??;
+        let file = AsyncFile::from_std(
+            stage
+                .reopen()
+                .inspect_err(|error| cache_warning("open_staging_file", error))
+                .ok()?,
+        );
         Some(Self {
             reservation,
             stage,
@@ -546,13 +670,82 @@ impl StagedInterval {
     }
 
     async fn commit(mut self, version: Arc<CacheVersion>) {
-        if self.file.flush().await.is_err() {
+        if let Err(error) = self.file.flush().await {
+            cache_warning("flush_interval", &error);
             return;
         }
         drop(self.file.into_std().await);
-        let _ = tokio::task::spawn_blocking(move || {
-            self.reservation.commit(self.stage, self.span, version)
+        let span = tracing::Span::current();
+        let result = tokio::task::spawn_blocking(move || {
+            span.in_scope(|| self.reservation.commit(self.stage, self.span, version))
         })
         .await;
+        if let Err(error) = result
+            .context("cache commit task")
+            .and_then(|result| result)
+        {
+            cache_warning("commit_interval", &format_args!("{error:#}"));
+        }
+    }
+}
+
+struct DirectoryLease {
+    lock: File,
+    #[cfg(not(unix))]
+    marker: tempfile::NamedTempFile,
+}
+
+impl DirectoryLease {
+    fn acquire(dir: &Path) -> Result<Self> {
+        fs::create_dir_all(dir).context("create cache directory")?;
+        let lock = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".lock"))
+            .context("open cache lock")?;
+        lock.try_lock().context("cache directory already in use")?;
+        let lease = Self {
+            lock,
+            #[cfg(not(unix))]
+            marker: tempfile::Builder::new()
+                .prefix(".rpc-lease-")
+                .tempfile_in(dir)?,
+        };
+        ensure!(lease.is_current(dir), "cache lock path changed");
+        Ok(lease)
+    }
+
+    fn is_current(&self, dir: &Path) -> bool {
+        let Ok(current) = fs::metadata(dir.join(".lock")) else {
+            return false;
+        };
+        let Ok(held) = self.lock.metadata() else {
+            return false;
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            (current.dev(), current.ino()) == (held.dev(), held.ino())
+        }
+        #[cfg(not(unix))]
+        {
+            self.marker.path().is_file() && current.created().ok() == held.created().ok()
+        }
+    }
+}
+
+fn cache_warning(operation: &'static str, error: &dyn std::fmt::Display) {
+    static LAST: std::sync::LazyLock<Mutex<HashMap<&'static str, Instant>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    let mut last = LAST.lock().unwrap();
+    if last
+        .get(operation)
+        .is_none_or(|previous| now.duration_since(*previous) >= Duration::from_secs(10))
+    {
+        last.insert(operation, now);
+        tracing::warn!(operation, %error, "cache operation failed");
     }
 }

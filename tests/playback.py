@@ -117,7 +117,7 @@ class PlaybackTests(unittest.TestCase):
         self.proxy = None
         self.addCleanup(self.stop)
 
-    def start(self, capacity=1024, private=True):
+    def start(self, capacity=1024, private=True, log_level="info"):
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             self.port = sock.getsockname()[1]
@@ -126,17 +126,21 @@ class PlaybackTests(unittest.TestCase):
             env={**os.environ, "RPC_LISTEN": f"127.0.0.1:{self.port}",
                  "RPC_ORIGIN_HOSTS": "127.0.0.1",
                  "RPC_ALLOW_PRIVATE_ORIGINS": str(private).lower(),
-                 "RPC_CACHE_DIR": str(self.cache), "RPC_CACHE_BYTES": str(capacity)},
+                 "RPC_CACHE_DIR": str(self.cache), "RPC_CACHE_BYTES": str(capacity),
+                 "RPC_LOG_LEVEL": log_level},
             stderr=subprocess.PIPE,
         )
-        line = self.proxy.stderr.readline().decode()
+        while line := self.proxy.stderr.readline().decode():
+            if "listening on" in line:
+                break
         self.assertIn("listening on", line)
 
     def stop(self):
         if self.proxy is not None:
             self.proxy.terminate()
-            self.proxy.communicate(timeout=5)
+            _, logs = self.proxy.communicate(timeout=5)
             self.proxy = None
+            return logs.decode()
 
     def get(self, spec=None, path=SIGNED_PATH, method="GET", headers_received=None):
         headers = {"Range": f"bytes={spec}"} if spec is not None else {}
@@ -173,6 +177,94 @@ class PlaybackTests(unittest.TestCase):
                        env={**os.environ, "RPC_CACHE_DIR": str(self.cache)})
         self.start()
         self.assertEqual(self.get("80-99")[0], 403)
+
+    def test_deleted_interval_is_refilled_and_hits_again(self):
+        self.start(log_level="debug")
+        self.get("40-59")
+        self.get("60-79")
+        next(path for path in self.cache.glob("*.data")
+             if path.read_bytes() == self.origin.data[40:60]).unlink()
+        self.assertEqual(self.get("40-79")[2], self.origin.data[40:80])
+        self.assertEqual(self.get("40-79")[2], self.origin.data[40:80])
+        self.assertEqual([item[2] for item in self.origin.requests],
+                         ["bytes=40-59", "bytes=60-79", "bytes=40-59"])
+        logs = self.stop()
+        for field in ("read_interval", "request_id=", "cache_key=", "cache hit", "elapsed_ms="):
+            self.assertIn(field, logs)
+        self.assertNotIn(SIGNED_PATH, logs)
+        self.assertNotIn("token=a%2Fb", logs)
+
+    def test_directory_recovery_discards_inflight_old_writes(self):
+        self.start()
+        self.get("0-9")
+        self.origin.block_range = "bytes=20-39"
+        headers_received = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            inflight = executor.submit(self.get, "20-39", SIGNED_PATH, "GET", headers_received)
+            try:
+                self.assertTrue(headers_received.wait(5))
+                shutil.rmtree(self.cache)
+                self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
+                self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
+            finally:
+                self.origin.release_range.set()
+            self.assertEqual(inflight.result()[2], self.origin.data[20:40])
+        self.assertEqual(self.get("20-39")[2], self.origin.data[20:40])
+        self.assertEqual(self.get("20-39")[2], self.origin.data[20:40])
+        self.assertEqual([item[2] for item in self.origin.requests],
+                         ["bytes=0-9", "bytes=20-39", "bytes=0-9", "bytes=20-39"])
+        self.assertIn("cache directory recovered", self.stop())
+
+    @unittest.skipUnless(os.name == "posix", "requires POSIX flock")
+    def test_recovery_waits_for_exclusive_directory_lock(self):
+        import fcntl
+
+        self.start()
+        self.get("0-9")
+        shutil.rmtree(self.cache)
+        self.cache.mkdir()
+        with (self.cache / ".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
+            self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
+            self.assertEqual(list(self.cache.glob("*.data")), [])
+        self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
+        self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
+        self.assertEqual(len(self.origin.requests), 4)
+        logs = self.stop()
+        self.assertEqual(logs.count('operation="recover_directory"'), 1)
+        self.assertIn("cache directory recovered", logs)
+
+    def test_deleted_interval_after_headers_requires_same_version(self):
+        self.start()
+        for expected_same_version in (True, False):
+            with self.subTest(same_version=expected_same_version):
+                self.get("0-9")
+                self.get("20-29")
+                self.origin.block_range = "bytes=10-19"
+                self.origin.release_range.clear()
+                headers_received = threading.Event()
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    inflight = executor.submit(self.get, "0-29", SIGNED_PATH, "GET", headers_received)
+                    try:
+                        self.assertTrue(headers_received.wait(5))
+                        next(path for path in self.cache.glob("*.data")
+                             if path.read_bytes() == self.origin.data[20:30]).unlink()
+                        if not expected_same_version:
+                            self.origin.etag = '"replacement"'
+                    finally:
+                        self.origin.release_range.set()
+                    if expected_same_version:
+                        self.assertEqual(inflight.result()[2], self.origin.data[:30])
+                        self.assertEqual(self.origin.requests[-1][2], "bytes=20-29")
+                        self.origin.block_range = None
+                        self.stop()
+                        shutil.rmtree(self.cache)
+                        self.start()
+                    else:
+                        with self.assertRaises(http.client.IncompleteRead) as error:
+                            inflight.result()
+                        self.assertEqual(error.exception.partial, self.origin.data[:20])
 
     def test_fill_only_gaps_then_replace_representation(self):
         self.start()

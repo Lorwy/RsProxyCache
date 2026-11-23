@@ -12,6 +12,14 @@ use tokio::net::TcpListener;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let level = setting("RPC_LOG_LEVEL", "info")
+        .parse::<tracing::level_filters::LevelFilter>()
+        .context("invalid RPC_LOG_LEVEL")?;
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(level)
+        .with_target(false)
+        .init();
     let mut args = std::env::args().skip(1);
     let command = args.next();
     if command
@@ -49,21 +57,26 @@ async fn main() -> Result<()> {
         .parse::<bool>()
         .context("invalid RPC_ALLOW_PRIVATE_ORIGINS")?;
 
+    let origin_hosts = hosts.len();
+    let cache_dir = dir.clone();
     let playback = Arc::new(playback::Playback::new(
         cache::Cache::open(dir, capacity)?,
         origin::Origin::new(hosts, allow_private)?,
     ));
     let listener = TcpListener::bind(setting("RPC_LISTEN", "127.0.0.1:8080")).await?;
-    eprintln!("listening on {}", listener.local_addr()?);
+    tracing::info!(listen = %listener.local_addr()?, cache_dir = %cache_dir.display(), capacity_bytes = capacity, origin_hosts, allow_private, "listening on configured address");
     loop {
         let (stream, _) = listener.accept().await?;
         let playback = playback.clone();
         tokio::spawn(async move {
             let service = service_fn(move |request| playback.clone().request(request));
-            let _ = http1::Builder::new()
+            if let Err(error) = http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
                 .serve_connection(TokioIo::new(stream), service)
-                .await;
+                .await
+            {
+                tracing::debug!(%error, "client connection ended with an error");
+            }
         });
     }
 }

@@ -3,7 +3,11 @@ use std::{
     convert::Infallible,
     io,
     ops::Range,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -18,6 +22,8 @@ use tokio::{
     sync::{OwnedMutexGuard, mpsc, watch},
     time::timeout,
 };
+
+use tracing::Instrument;
 
 use crate::{
     cache::{self, Cache, CacheVersion, Entry, IntervalWriter, Metadata, Piece},
@@ -49,7 +55,7 @@ enum Part {
     RemoteRange {
         body: Incoming,
         span: Range<u64>,
-        version: Arc<CacheVersion>,
+        version: Option<Arc<CacheVersion>>,
         flight: Option<GapLeader>,
     },
     Passthrough {
@@ -114,10 +120,22 @@ impl Playback {
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
-        let response = match self.handle(request).await {
-            Ok(response) => response,
-            Err(_) => plain(StatusCode::BAD_GATEWAY, "origin or cache request failed"),
-        };
+        static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+        let request_id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+        let span = tracing::warn_span!("playback", request_id, cache_key = tracing::field::Empty);
+        let started = Instant::now();
+        let method = request.method().clone();
+        let response = async {
+            let response = match self.handle(request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::warn!(error = %format_args!("{error:#}"), "playback request failed");
+                    plain(StatusCode::BAD_GATEWAY, "origin or cache request failed")
+                }
+            };
+            tracing::debug!(%method, status = response.status().as_u16(), elapsed_ms = started.elapsed().as_millis(), "response headers ready");
+            response
+        }.instrument(span).await;
         Ok(response)
     }
 
@@ -156,14 +174,19 @@ impl Playback {
             }
         };
         let key = cache::key(source);
+        tracing::Span::current().record("cache_key", &key);
+        tracing::debug!(range = %requested.upstream(), "playback request");
+
         let guard = if head {
             None
         } else {
             Some(self.lock(&format!("{key}:{}", requested.upstream())).await)
         };
+        let generation = self.cache.refresh();
         let previous = self.cache.metadata(&key);
         if head {
             if let Some(metadata) = previous {
+                tracing::debug!("cached metadata hit");
                 return media_response(requested, 0..metadata.size, &metadata, empty());
             }
             let origin = self.origin.fetch(source, Method::HEAD, None).await?;
@@ -179,7 +202,8 @@ impl Playback {
                         } else {
                             guard
                         };
-                        let body = self.stream(parts, hold);
+                        let body =
+                            self.stream(parts, hold, Some((source.to_owned(), metadata.clone())));
                         return media_response(requested, span, metadata, body);
                     }
                     Prepared::Failure(response) => return Ok(response),
@@ -190,6 +214,7 @@ impl Playback {
             }
         }
 
+        tracing::debug!("cache miss");
         let mut origin = self
             .origin
             .fetch(source, Method::GET, Some(&requested.upstream()))
@@ -207,14 +232,14 @@ impl Playback {
                     requested.resolve(metadata.size).as_ref() == Some(&span),
                     "unexpected origin byte range"
                 );
-                let version = self.cache.adopt(&key, metadata.clone());
+                let version = self.cache.adopt(&key, metadata.clone(), generation);
                 let part = Part::RemoteRange {
                     body: origin.into_body(),
                     version,
                     span: span.clone(),
                     flight: None,
                 };
-                let body = self.stream(vec![part], guard);
+                let body = self.stream(vec![part], guard, None);
                 media_response(requested, span, &metadata, body)
             }
             StatusCode::OK if matches!(requested, Requested::Whole) => {
@@ -225,14 +250,14 @@ impl Playback {
                     body: origin.into_body(),
                     length: content_length(&headers)?,
                 };
-                let body = self.stream(vec![part], guard);
+                let body = self.stream(vec![part], guard, None);
                 relay_headers(status, &headers, body)
             }
-            StatusCode::OK => Ok(plain(StatusCode::BAD_GATEWAY, "origin ignored Range")),
+            StatusCode::OK => anyhow::bail!("origin ignored Range"),
             status if status.is_client_error() || status.is_server_error() => {
                 relay_headers(status, origin.headers(), empty())
             }
-            _ => Ok(plain(StatusCode::BAD_GATEWAY, "unexpected origin response")),
+            _ => anyhow::bail!("unexpected origin response"),
         }
     }
 
@@ -273,7 +298,15 @@ impl Playback {
         span: Range<u64>,
         metadata: &Metadata,
     ) -> Result<Prepared> {
-        let plan = self.cache.plan(key, span, metadata);
+        let plan = loop {
+            let plan = self.cache.plan(key, span.clone(), metadata);
+            if plan.iter().all(|piece| match piece {
+                Piece::Cached(entry, span) => self.cache.open_entry(entry, span).is_ok(),
+                Piece::Missing(_) => true,
+            }) {
+                break plan;
+            }
+        };
         if !plan.iter().any(|piece| matches!(piece, Piece::Cached(..))) {
             return Ok(Prepared::Retry);
         }
@@ -286,6 +319,12 @@ impl Playback {
             None
         };
 
+        tracing::debug!(
+            start = span.start,
+            end_exclusive = span.end,
+            partial = version.is_some(),
+            "cache hit"
+        );
         let mut pending = VecDeque::from(plan);
         let mut parts = Vec::with_capacity(pending.len());
         // Acquire gaps in increasing byte order, even when a gap has split after waiting.
@@ -346,6 +385,7 @@ impl Playback {
                         flight.finish(GapOutcome::Failed(StatusCode::BAD_GATEWAY));
                     })?;
                     if actual != *metadata {
+                        tracing::info!("origin representation changed");
                         self.cache.invalidate(version);
                         return Ok(Prepared::Retry);
                     }
@@ -355,7 +395,7 @@ impl Playback {
                     }
                     parts.push(Part::RemoteRange {
                         body: response.into_body(),
-                        version: version.clone(),
+                        version: Some(version.clone()),
                         span,
                         flight: Some(flight),
                     });
@@ -366,6 +406,12 @@ impl Playback {
             .as_ref()
             .is_some_and(|version| !self.cache.is_current(version))
         {
+            return Ok(Prepared::Retry);
+        }
+        if parts.iter().any(|part| match part {
+            Part::Local { span, entry } => self.cache.open_entry(entry, span).is_err(),
+            _ => false,
+        }) {
             return Ok(Prepared::Retry);
         }
         Ok(Prepared::Parts(parts))
@@ -394,14 +440,30 @@ impl Playback {
         result
     }
 
-    fn stream(&self, parts: Vec<Part>, guard: Option<OwnedMutexGuard<()>>) -> Body {
+    fn stream(
+        self: &Arc<Self>,
+        parts: Vec<Part>,
+        guard: Option<OwnedMutexGuard<()>>,
+        local_context: Option<(String, Metadata)>,
+    ) -> Body {
         let (sender, receiver) = mpsc::channel(4);
-        let cache = self.cache.clone();
+        let playback = self.clone();
         tokio::spawn(async move {
             let _guard = guard;
             for part in parts {
                 let result = match part {
-                    Part::Local { span, entry } => send_local(&sender, &entry, span).await,
+                    Part::Local { span, entry } => {
+                        match playback.cache.open_entry(&entry, &span) {
+                            Ok((file, offset)) => {
+                                entry.touch(&file);
+                                send_local(&sender, file, offset, span.end - span.start).await
+                            }
+                            Err(_) => {
+                                let (source, metadata) = local_context.as_ref().expect("local playback context");
+                                playback.recover_stream_range(&sender, source, metadata, span).await
+                            }
+                        }
+                    }
                     Part::RemoteRange {
                         body,
                         span,
@@ -409,7 +471,7 @@ impl Playback {
                         flight,
                     } => {
                         let length = span.end - span.start;
-                        let writer = cache.writer(version, span);
+                        let writer = version.and_then(|version| playback.cache.writer(version, span));
                         let result = send_remote(&sender, body, Some(length), writer).await;
                         if let Some(flight) = flight {
                             flight.finish(if result.is_ok() {
@@ -425,22 +487,62 @@ impl Playback {
                     }
                 };
                 if let Err(error) = result {
-                    let _ = sender.send(Err(io::Error::other(error))).await;
+                    if sender.is_closed() {
+                        tracing::debug!("client closed playback response");
+                    } else {
+                        tracing::warn!(error = %format_args!("{error:#}"), "playback stream interrupted");
+                        let _ = sender.send(Err(io::Error::other(error))).await;
+                    }
                     break;
                 }
             }
-        });
+        }.in_current_span());
         StreamBody::new(stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|frame| (frame, receiver))
         }))
         .boxed_unsync()
     }
+    async fn recover_stream_range(
+        &self,
+        sender: &Sender,
+        source: &str,
+        metadata: &Metadata,
+        span: Range<u64>,
+    ) -> Result<()> {
+        ensure!(
+            metadata.etag.is_some(),
+            "cannot recover stream without a strong ETag"
+        );
+        let response = self
+            .origin
+            .fetch(source, Method::GET, Some(&range::upstream(&span)))
+            .await?;
+        ensure!(
+            response.status() == StatusCode::PARTIAL_CONTENT,
+            "origin did not return the missing stream range"
+        );
+        let (actual_span, actual) = partial_metadata(&response)?;
+        ensure!(
+            actual_span == span && actual == *metadata,
+            "origin representation changed during playback"
+        );
+        let length = span.end - span.start;
+        // Another request may already have adopted a newer version.
+        let writer = self
+            .cache
+            .version_for_patch(&cache::key(source), metadata)
+            .and_then(|version| self.cache.writer(version, span));
+        send_remote(sender, response.into_body(), Some(length), writer).await
+    }
 }
 
-async fn send_local(sender: &Sender, entry: &Entry, span: Range<u64>) -> Result<()> {
-    let (file, offset) = entry.open(&span)?;
+async fn send_local(
+    sender: &Sender,
+    file: std::fs::File,
+    offset: u64,
+    mut remaining: u64,
+) -> Result<()> {
     let mut file = File::from_std(file);
-    let mut remaining = span.end - span.start;
     file.seek(SeekFrom::Start(offset)).await?;
     let mut buffer = vec![0; 64 * 1024];
     while remaining > 0 {

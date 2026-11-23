@@ -20,6 +20,7 @@ RPC_ORIGIN_HOSTS=media.example.com,cdn.example.com cargo run --release --locked
 | `RPC_LISTEN` | `127.0.0.1:8080` | 服务监听地址 |
 | `RPC_CACHE_DIR` | `./cache` | 单实例独占的磁盘缓存目录 |
 | `RPC_CACHE_BYTES` | `10737418240` | 缓存数据容量上限，单位为字节 |
+| `RPC_LOG_LEVEL` | `info` | 标准错误日志级别，支持 `error`、`warn`、`info`、`debug`、`trace`、`off` |
 | `RPC_ALLOW_PRIVATE_ORIGINS` | `false` | 允许连接白名单内的非公网源站，例如内网 NAS |
 
 通过受控内网或本机入口部署。经过反向代理时保留原始路径和查询串，尤其是源地址的双斜杠、百分号编码和签名参数。若需对外提供 HTTPS，可在入口终止 TLS。源地址和代理播放地址都可能包含签名，应按凭据处理。
@@ -31,11 +32,17 @@ RPC_ORIGIN_HOSTS=media.example.com,cdn.example.com cargo run --release --locked
 - 缓存无 TTL，跨重启保留，容量不足时按全局 LRU 淘汰区间。补齐缺口时，只有源站目标和强 `ETag` 一致才合并字节。
 - 同一视频版本、同一缺失区间的并发请求共享回源，下载成功后从缓存读取该区间。缓存容量不足或写入失败时，等待的请求可能再次回源。
 
+运行时发现缓存文件缺失，会移除失效索引并回源补齐。整个缓存目录丢失后，服务尝试重建并重新取得独占锁。磁盘或锁暂不可用时，请求仍可回源，后续请求会再次尝试恢复缓存。响应已经开始时，只在能确认目标与强 `ETag` 一致的情况下补齐缺失区间。
+
 同一源地址换片后，如需立即清理旧版本，停止服务后在同一个缓存目录运行：
 
 ```sh
 RPC_CACHE_DIR=./cache target/release/rs-proxy-cache clear 'https://media.example.com/video.mp4?token=a%2Fb&expires=123'
 ```
+
+## 日志
+
+服务向标准错误输出带时间、级别和键值字段的日志。默认记录启动配置、缓存目录恢复、磁盘故障、回源失败和播放流中断。同类磁盘故障每 10 秒最多报告一次。使用 `RPC_LOG_LEVEL=debug` 可查看请求区间、缓存命中、回源状态码和响应头耗时。请求相关事件带有请求 ID，解析出有效源地址后还会附上哈希缓存键。日志省略签名 URL、鉴权头和 Cookie。
 
 ## 验证
 

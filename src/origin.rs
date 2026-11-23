@@ -2,7 +2,7 @@ use std::{
     collections::HashSet,
     net::{IpAddr, SocketAddr},
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -62,9 +62,26 @@ impl Origin {
         range: Option<&str>,
     ) -> Result<Response<Incoming>> {
         let mut source = source.to_owned();
-        for _ in 0..=5 {
+        for hop in 0..=5 {
+            let started = Instant::now();
             let uri = self.validate(&source)?;
-            let mut response = timeout(TIMEOUT, self.send(&uri, method.clone(), range)).await??;
+            let mut response = timeout(TIMEOUT, self.send(&uri, method.clone(), range))
+                .await
+                .context("origin headers timed out")?
+                .context("origin request failed")?;
+            let status = response.status().as_u16();
+            let elapsed_ms = started.elapsed().as_millis();
+            if response.status().is_client_error() || response.status().is_server_error() {
+                tracing::warn!(
+                    status,
+                    hop,
+                    range,
+                    elapsed_ms,
+                    "origin returned an error status"
+                );
+            } else {
+                tracing::debug!(status, hop, range, elapsed_ms, "origin response headers");
+            }
             if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
                 response
                     .extensions_mut()
@@ -97,11 +114,14 @@ impl Origin {
 
         // Resolve once and connect directly to an approved address.
         let addresses = lookup_host((host, port))
-            .await?
+            .await
+            .context("resolve origin host")?
             .filter(|address| self.allow_private || public(address.ip()))
             .collect::<Vec<SocketAddr>>();
         ensure!(!addresses.is_empty(), "no permitted origin address");
-        let stream = TcpStream::connect(addresses.as_slice()).await?;
+        let stream = TcpStream::connect(addresses.as_slice())
+            .await
+            .context("connect to origin")?;
         let target = uri.path_and_query().map_or("/", |value| value.as_str());
         let target = if target.starts_with('?') {
             format!("/{target}")
@@ -122,7 +142,14 @@ impl Origin {
         let request = request.body(Empty::new())?;
         if https {
             let name = ServerName::try_from(host.to_owned())?;
-            send(self.tls.connect(name, stream).await?, request).await
+            send(
+                self.tls
+                    .connect(name, stream)
+                    .await
+                    .context("origin TLS handshake")?,
+                request,
+            )
+            .await
         } else {
             send(stream, request).await
         }
