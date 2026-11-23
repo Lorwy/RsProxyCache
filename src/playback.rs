@@ -37,6 +37,7 @@ type Sender = mpsc::Sender<io::Result<Frame<Bytes>>>;
 pub struct Playback {
     pub cache: Arc<Cache>,
     pub origin: Origin,
+    pub(crate) signing_key: Option<ring::hmac::Key>,
     request_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     gaps: Mutex<HashMap<GapKey, Weak<GapFlight>>>,
 }
@@ -111,6 +112,7 @@ impl Playback {
         Self {
             cache,
             origin,
+            signing_key: None,
             request_locks: Mutex::default(),
             gaps: Mutex::default(),
         }
@@ -146,6 +148,14 @@ impl Playback {
             .and_then(|value| value.as_str().strip_prefix("/v1/"))
         else {
             return Ok(plain(StatusCode::NOT_FOUND, "unknown playback path"));
+        };
+        let source = if let Some(key) = &self.signing_key {
+            let Some(source) = crate::mobile::verify(key, source) else {
+                return Ok(plain(StatusCode::NOT_FOUND, "unknown playback path"));
+            };
+            source
+        } else {
+            source
         };
         if self.origin.validate(source).is_err() {
             return Ok(plain(

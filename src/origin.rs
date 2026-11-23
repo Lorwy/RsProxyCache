@@ -11,6 +11,7 @@ use http_body_util::Empty;
 use hyper::{body::Incoming, client::conn::http1};
 use hyper_util::rt::TokioIo;
 use rustls::{ClientConfig, pki_types::ServerName};
+#[cfg(not(target_os = "android"))]
 use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -32,10 +33,18 @@ pub struct Origin {
 
 impl Origin {
     pub fn new(hosts: HashSet<String>, allow_private: bool) -> Result<Self> {
+        #[cfg(not(target_os = "android"))]
+        let tls = ClientConfig::with_platform_verifier()?;
+        #[cfg(target_os = "android")]
+        let tls = ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::from_iter(
+                webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+            ))
+            .with_no_client_auth();
         Ok(Self {
             hosts,
             allow_private,
-            tls: TlsConnector::from(Arc::new(ClientConfig::with_platform_verifier()?)),
+            tls: TlsConnector::from(Arc::new(tls)),
         })
     }
 

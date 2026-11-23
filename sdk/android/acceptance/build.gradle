@@ -1,0 +1,21 @@
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies { classpath 'com.android.tools.build:gradle:9.1.0' }
+}
+apply plugin: 'com.android.application'
+
+android {
+    namespace 'cn.gavinliu.rpcacceptance'
+    compileSdk 36
+    defaultConfig {
+        applicationId 'cn.gavinliu.rpcacceptance'
+        minSdk 24
+        targetSdk 36
+    }
+}
+
+dependencies {
+    implementation files('../../../target/sdk/rs-proxy-cache.aar')
+    implementation 'androidx.media3:media3-exoplayer:1.8.0'
+    implementation 'androidx.media3:media3-ui:1.8.0'
+}

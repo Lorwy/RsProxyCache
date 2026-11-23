@@ -1,13 +1,7 @@
-mod cache;
-mod origin;
-mod playback;
-mod range;
-
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
-use hyper::{server::conn::http1, service::service_fn};
-use hyper_util::rt::TokioIo;
+use rs_proxy_cache::{cache, origin, playback};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -65,20 +59,7 @@ async fn main() -> Result<()> {
     ));
     let listener = TcpListener::bind(setting("RPC_LISTEN", "127.0.0.1:8080")).await?;
     tracing::info!(listen = %listener.local_addr()?, cache_dir = %cache_dir.display(), capacity_bytes = capacity, origin_hosts, allow_private, "listening on configured address");
-    loop {
-        let (stream, _) = listener.accept().await?;
-        let playback = playback.clone();
-        tokio::spawn(async move {
-            let service = service_fn(move |request| playback.clone().request(request));
-            if let Err(error) = http1::Builder::new()
-                .timer(hyper_util::rt::TokioTimer::new())
-                .serve_connection(TokioIo::new(stream), service)
-                .await
-            {
-                tracing::debug!(%error, "client connection ended with an error");
-            }
-        });
-    }
+    Ok(rs_proxy_cache::serve(listener, playback).await?)
 }
 
 fn setting(name: &str, default: &str) -> String {

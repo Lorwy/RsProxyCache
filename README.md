@@ -52,3 +52,7 @@ python3 tests/playback.py -v
 ```
 
 测试使用本机回环接口和临时缓存目录。系统安装了 FFmpeg 时，还会生成真实 MP4，经代理验证解码、跳转与源地址保真。实际播放器的接入验收见 [首版播放验收](docs/playback-acceptance.md)。
+
+## 移动端 SDK
+
+Android AAR 和 iOS XCFramework 共用 Rust 代理与磁盘缓存。构建、接入及验收见 [移动端接入](sdk/README.md)。

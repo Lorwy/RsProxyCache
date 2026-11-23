@@ -125,16 +125,28 @@ impl Drop for Reservation {
 impl Cache {
     pub fn open(dir: PathBuf, capacity: u64) -> Result<Arc<Self>> {
         let index = Self::load_index(&dir, capacity)?;
+        Ok(Self::with_index(dir, capacity, index))
+    }
+
+    pub(crate) fn open_recoverable(dir: PathBuf, capacity: u64) -> Arc<Self> {
+        let index = Self::load_index(&dir, capacity).unwrap_or_else(|error| {
+            cache_warning("open_directory", &format_args!("{error:#}"));
+            Index::default()
+        });
+        Self::with_index(dir, capacity, index)
+    }
+
+    fn with_index(dir: PathBuf, capacity: u64, index: Index) -> Arc<Self> {
         tracing::debug!(
             intervals = index.entries.values().map(Vec::len).sum::<usize>(),
             bytes = index.size,
             "cache opened"
         );
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             dir,
             capacity,
             index: Mutex::new(index),
-        }))
+        })
     }
 
     fn load_index(dir: &Path, capacity: u64) -> Result<Index> {
@@ -705,7 +717,20 @@ impl DirectoryLease {
             .truncate(false)
             .open(dir.join(".lock"))
             .context("open cache lock")?;
-        lock.try_lock().context("cache directory already in use")?;
+        #[cfg(not(target_os = "android"))]
+        lock.try_lock()
+            .context("cannot acquire cache directory lock")?;
+        #[cfg(target_os = "android")]
+        {
+            use std::os::fd::AsRawFd;
+            // Rust's File::try_lock is unsupported on Android. The descriptor
+            // retains this nonblocking flock until DirectoryLease is dropped.
+            let status = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if status != 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("cannot acquire cache directory lock");
+            }
+        }
         let lease = Self {
             lock,
             #[cfg(not(unix))]
