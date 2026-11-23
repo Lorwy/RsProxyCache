@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     io,
     ops::Range,
@@ -14,13 +14,13 @@ use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
 use hyper::body::{Frame, Incoming};
 use tokio::{
     fs::File,
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom},
-    sync::{OwnedMutexGuard, mpsc},
+    io::{AsyncReadExt, AsyncSeekExt, SeekFrom},
+    sync::{OwnedMutexGuard, mpsc, watch},
     time::timeout,
 };
 
 use crate::{
-    cache::{self, Cache, Entry, Metadata, Piece},
+    cache::{self, Cache, CacheVersion, Entry, IntervalWriter, Metadata, Piece},
     origin::{FinalTarget, Origin, TIMEOUT},
     range::{self, Requested},
 };
@@ -31,7 +31,8 @@ type Sender = mpsc::Sender<io::Result<Frame<Bytes>>>;
 pub struct Playback {
     pub cache: Arc<Cache>,
     pub origin: Origin,
-    pub locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    request_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
+    gaps: Mutex<HashMap<GapKey, Weak<GapFlight>>>,
 }
 
 enum Prepared {
@@ -45,14 +46,70 @@ enum Part {
         span: Range<u64>,
         entry: Arc<Entry>,
     },
-    Remote {
+    RemoteRange {
         body: Incoming,
-        span: Option<Range<u64>>,
+        span: Range<u64>,
+        version: Arc<CacheVersion>,
+        flight: Option<GapLeader>,
+    },
+    Passthrough {
+        body: Incoming,
         length: Option<u64>,
     },
 }
 
+#[derive(Eq, Hash, PartialEq)]
+struct GapKey {
+    version: u64,
+    span: Range<u64>,
+}
+
+#[derive(Clone, Copy)]
+enum GapOutcome {
+    Ready,
+    Retry,
+    Failed(StatusCode),
+}
+
+struct GapFlight {
+    completion: watch::Sender<Option<GapOutcome>>,
+}
+
+struct GapLeader(Arc<GapFlight>);
+
+impl GapLeader {
+    fn finish(&self, outcome: GapOutcome) {
+        self.0.completion.send_replace(Some(outcome));
+    }
+}
+
+impl Drop for GapLeader {
+    fn drop(&mut self) {
+        self.0.completion.send_if_modified(|outcome| {
+            if outcome.is_some() {
+                return false;
+            }
+            *outcome = Some(GapOutcome::Retry);
+            true
+        });
+    }
+}
+
+enum GapClaim {
+    Leader(GapLeader),
+    Waiting(watch::Receiver<Option<GapOutcome>>),
+}
+
 impl Playback {
+    pub fn new(cache: Arc<Cache>, origin: Origin) -> Self {
+        Self {
+            cache,
+            origin,
+            request_locks: Mutex::default(),
+            gaps: Mutex::default(),
+        }
+    }
+
     pub async fn request(
         self: Arc<Self>,
         request: Request<Incoming>,
@@ -117,14 +174,13 @@ impl Playback {
             if let Some(span) = requested.resolve(metadata.size) {
                 match self.prepare(source, &key, span.clone(), metadata).await? {
                     Prepared::Parts(parts) => {
-                        if parts.iter().all(|part| matches!(part, Part::Local { .. })) {
-                            let body = self.stream(key, None, parts, None);
-                            return media_response(requested, span, metadata, body);
-                        }
-                        if let Some(version) = self.cache.patch_version(&key, metadata) {
-                            let body = self.stream(key, Some(version), parts, guard);
-                            return media_response(requested, span, metadata, body);
-                        }
+                        let hold = if parts.iter().all(|part| matches!(part, Part::Local { .. })) {
+                            None
+                        } else {
+                            guard
+                        };
+                        let body = self.stream(parts, hold);
+                        return media_response(requested, span, metadata, body);
                     }
                     Prepared::Failure(response) => return Ok(response),
                     Prepared::Retry => {}
@@ -152,24 +208,24 @@ impl Playback {
                     "unexpected origin byte range"
                 );
                 let version = self.cache.adopt(&key, metadata.clone());
-                let part = Part::Remote {
+                let part = Part::RemoteRange {
                     body: origin.into_body(),
-                    length: Some(span.end - span.start),
-                    span: Some(span.clone()),
+                    version,
+                    span: span.clone(),
+                    flight: None,
                 };
-                let body = self.stream(key, Some(version), vec![part], guard);
+                let body = self.stream(vec![part], guard);
                 media_response(requested, span, &metadata, body)
             }
             StatusCode::OK if matches!(requested, Requested::Whole) => {
                 identity(origin.headers())?;
                 let status = origin.status();
                 let headers = origin.headers().clone();
-                let part = Part::Remote {
+                let part = Part::Passthrough {
                     body: origin.into_body(),
-                    span: None,
                     length: content_length(&headers)?,
                 };
-                let body = self.stream(key, None, vec![part], guard);
+                let body = self.stream(vec![part], guard);
                 relay_headers(status, &headers, body)
             }
             StatusCode::OK => Ok(plain(StatusCode::BAD_GATEWAY, "origin ignored Range")),
@@ -182,7 +238,7 @@ impl Playback {
 
     async fn lock(&self, key: &str) -> OwnedMutexGuard<()> {
         let lock = {
-            let mut locks = self.locks.lock().unwrap();
+            let mut locks = self.request_locks.lock().unwrap();
             locks.retain(|_, lock| lock.strong_count() > 0);
             if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
                 lock
@@ -193,6 +249,21 @@ impl Playback {
             }
         };
         lock.lock_owned().await
+    }
+
+    fn claim_gap(&self, key: GapKey) -> GapClaim {
+        let mut gaps = self.gaps.lock().unwrap();
+        gaps.retain(|_, flight| flight.strong_count() > 0);
+        if let Some(flight) = gaps.get(&key).and_then(Weak::upgrade)
+            && flight.completion.borrow().is_none()
+        {
+            return GapClaim::Waiting(flight.completion.subscribe());
+        }
+        let flight = Arc::new(GapFlight {
+            completion: watch::channel(None).0,
+        });
+        gaps.insert(key, Arc::downgrade(&flight));
+        GapClaim::Leader(GapLeader(flight))
     }
 
     async fn prepare(
@@ -206,54 +277,124 @@ impl Playback {
         if !plan.iter().any(|piece| matches!(piece, Piece::Cached(..))) {
             return Ok(Prepared::Retry);
         }
-        let mut parts = Vec::with_capacity(plan.len());
-        for piece in plan {
+        let version = if plan.iter().any(|piece| matches!(piece, Piece::Missing(_))) {
+            let Some(version) = self.cache.version_for_patch(key, metadata) else {
+                return Ok(Prepared::Retry);
+            };
+            Some(version)
+        } else {
+            None
+        };
+
+        let mut pending = VecDeque::from(plan);
+        let mut parts = Vec::with_capacity(pending.len());
+        // Acquire gaps in increasing byte order, even when a gap has split after waiting.
+        while let Some(piece) = pending.pop_front() {
             match piece {
-                Piece::Cached(entry, span) => {
-                    parts.push(Part::Local { span, entry });
-                }
+                Piece::Cached(entry, span) => parts.push(Part::Local { span, entry }),
                 Piece::Missing(span) => {
-                    let response = self
-                        .origin
-                        .fetch(source, Method::GET, Some(&range::upstream(&span)))
-                        .await?;
-                    if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+                    let version = version.as_ref().context("missing cache version")?;
+                    if !self.cache.is_current(version) {
                         return Ok(Prepared::Retry);
                     }
-                    if response.status().is_client_error() || response.status().is_server_error() {
+                    let claim = self.claim_gap(GapKey {
+                        version: version.id(),
+                        span: span.clone(),
+                    });
+                    let flight = match claim {
+                        GapClaim::Leader(flight) => flight,
+                        GapClaim::Waiting(mut completion) => {
+                            let result = *completion.wait_for(Option::is_some).await?;
+                            match result.context("missing gap outcome")? {
+                                GapOutcome::Failed(status) => {
+                                    return Ok(Prepared::Failure(plain(
+                                        status,
+                                        "shared origin request failed",
+                                    )));
+                                }
+                                GapOutcome::Retry => return Ok(Prepared::Retry),
+                                GapOutcome::Ready => {}
+                            }
+                            pending.push_front(Piece::Missing(span));
+                            continue;
+                        }
+                    };
+                    let current = self.cache.plan(key, span.clone(), metadata);
+                    if current
+                        .iter()
+                        .any(|piece| matches!(piece, Piece::Cached(..)))
+                    {
+                        flight.finish(GapOutcome::Ready);
+                        for piece in current.into_iter().rev() {
+                            pending.push_front(piece);
+                        }
+                        continue;
+                    }
+                    let response = self.gap_response(source, &span, &flight).await?;
+                    let status = response.status();
+                    if status == StatusCode::RANGE_NOT_SATISFIABLE {
+                        return Ok(Prepared::Retry);
+                    }
+                    if status.is_client_error() || status.is_server_error() {
                         return Ok(Prepared::Failure(relay_headers(
-                            response.status(),
+                            status,
                             response.headers(),
                             empty(),
                         )?));
                     }
-                    ensure!(
-                        response.status() == StatusCode::PARTIAL_CONTENT,
-                        "origin ignored Range"
-                    );
-                    let (actual_span, actual) = partial_metadata(&response)?;
+                    let (actual_span, actual) = partial_metadata(&response).inspect_err(|_| {
+                        flight.finish(GapOutcome::Failed(StatusCode::BAD_GATEWAY));
+                    })?;
                     if actual != *metadata {
+                        self.cache.invalidate(version);
                         return Ok(Prepared::Retry);
                     }
-                    ensure!(actual_span == span, "unexpected origin byte range");
-                    parts.push(Part::Remote {
+                    if actual_span != span {
+                        flight.finish(GapOutcome::Failed(StatusCode::BAD_GATEWAY));
+                        anyhow::bail!("unexpected origin byte range");
+                    }
+                    parts.push(Part::RemoteRange {
                         body: response.into_body(),
-                        length: Some(span.end - span.start),
-                        span: Some(span),
+                        version: version.clone(),
+                        span,
+                        flight: Some(flight),
                     });
                 }
             }
         }
+        if version
+            .as_ref()
+            .is_some_and(|version| !self.cache.is_current(version))
+        {
+            return Ok(Prepared::Retry);
+        }
         Ok(Prepared::Parts(parts))
     }
 
-    fn stream(
-        self: &Arc<Self>,
-        key: String,
-        metadata: Option<Arc<Metadata>>,
-        parts: Vec<Part>,
-        guard: Option<OwnedMutexGuard<()>>,
-    ) -> Body {
+    async fn gap_response(
+        &self,
+        source: &str,
+        span: &Range<u64>,
+        flight: &GapLeader,
+    ) -> Result<Response<Incoming>> {
+        let result = self
+            .origin
+            .fetch(source, Method::GET, Some(&range::upstream(span)))
+            .await;
+        match result.as_ref().map(Response::status) {
+            Ok(StatusCode::RANGE_NOT_SATISFIABLE | StatusCode::PARTIAL_CONTENT) => {}
+            Ok(status) if status.is_client_error() || status.is_server_error() => {
+                flight.finish(GapOutcome::Failed(status));
+            }
+            _ => {
+                flight.finish(GapOutcome::Failed(StatusCode::BAD_GATEWAY));
+                ensure!(result.is_err(), "origin ignored Range");
+            }
+        }
+        result
+    }
+
+    fn stream(&self, parts: Vec<Part>, guard: Option<OwnedMutexGuard<()>>) -> Body {
         let (sender, receiver) = mpsc::channel(4);
         let cache = self.cache.clone();
         tokio::spawn(async move {
@@ -261,9 +402,26 @@ impl Playback {
             for part in parts {
                 let result = match part {
                     Part::Local { span, entry } => send_local(&sender, &entry, span).await,
-                    Part::Remote { body, span, length } => {
-                        send_remote(&sender, &cache, &key, metadata.as_ref(), body, span, length)
-                            .await
+                    Part::RemoteRange {
+                        body,
+                        span,
+                        version,
+                        flight,
+                    } => {
+                        let length = span.end - span.start;
+                        let writer = cache.writer(version, span);
+                        let result = send_remote(&sender, body, Some(length), writer).await;
+                        if let Some(flight) = flight {
+                            flight.finish(if result.is_ok() {
+                                GapOutcome::Ready
+                            } else {
+                                GapOutcome::Failed(StatusCode::BAD_GATEWAY)
+                            });
+                        }
+                        result
+                    }
+                    Part::Passthrough { body, length } => {
+                        send_remote(&sender, body, length, None).await
                     }
                 };
                 if let Err(error) = result {
@@ -299,30 +457,10 @@ async fn send_local(sender: &Sender, entry: &Entry, span: Range<u64>) -> Result<
 
 async fn send_remote(
     sender: &Sender,
-    cache: &Arc<Cache>,
-    key: &str,
-    metadata: Option<&Arc<Metadata>>,
     mut body: Incoming,
-    span: Option<Range<u64>>,
     length: Option<u64>,
+    mut writer: Option<IntervalWriter>,
 ) -> Result<()> {
-    let mut writer = match (span, metadata) {
-        (Some(span), Some(metadata)) => {
-            let chunk_size = if metadata.etag.is_some() {
-                cache.max_interval_size()
-            } else {
-                span.end - span.start
-            };
-            (chunk_size > 0).then(|| IntervalWriter {
-                chunk_size,
-                end: span.end,
-                next: span.start,
-                chunk_end: span.start,
-                chunk: None,
-            })
-        }
-        _ => None,
-    };
     let mut received = 0_u64;
     let mut last = None;
     loop {
@@ -344,8 +482,8 @@ async fn send_remote(
             length.is_none_or(|length| received <= length),
             "origin exceeded declared length"
         );
-        if let (Some(writer), Some(metadata)) = (&mut writer, metadata) {
-            writer.write(cache, key, metadata, &data).await;
+        if let Some(writer) = &mut writer {
+            writer.write(&data).await;
         }
         // Hold the final bytes until length is verified and the completed interval is published.
         if length == Some(received) {
@@ -358,89 +496,13 @@ async fn send_remote(
         length.is_none_or(|length| received == length),
         "origin ended early"
     );
-    if let (Some(writer), Some(metadata)) = (writer, metadata)
-        && let Some(chunk) = writer.chunk
-    {
-        chunk.commit(key, metadata).await;
+    if let Some(writer) = writer {
+        writer.finish().await;
     }
     if let Some(last) = last {
         sender.send(Ok(Frame::data(last))).await?;
     }
     Ok(())
-}
-
-struct IntervalWriter {
-    chunk_size: u64,
-    end: u64,
-    next: u64,
-    chunk_end: u64,
-    chunk: Option<StagedInterval>,
-}
-
-impl IntervalWriter {
-    async fn write(
-        &mut self,
-        cache: &Arc<Cache>,
-        key: &str,
-        metadata: &Arc<Metadata>,
-        mut data: &[u8],
-    ) {
-        while !data.is_empty() {
-            if self.next == self.chunk_end {
-                self.chunk_end = self.next.saturating_add(self.chunk_size).min(self.end);
-                self.chunk = StagedInterval::new(cache, self.next..self.chunk_end);
-            }
-            let size = (self.chunk_end - self.next).min(data.len() as u64) as usize;
-            if let Some(chunk) = &mut self.chunk
-                && chunk.file.write_all(&data[..size]).await.is_err()
-            {
-                self.chunk = None;
-            }
-            self.next += size as u64;
-            data = &data[size..];
-            if self.next == self.chunk_end
-                && self.next != self.end
-                && let Some(chunk) = self.chunk.take()
-            {
-                chunk.commit(key, metadata).await;
-            }
-        }
-    }
-}
-
-struct StagedInterval {
-    reservation: cache::Reservation,
-    stage: tempfile::NamedTempFile,
-    file: File,
-    span: Range<u64>,
-}
-
-impl StagedInterval {
-    fn new(cache: &Arc<Cache>, span: Range<u64>) -> Option<Self> {
-        let reservation = cache.reserve(span.end - span.start)?;
-        let stage = cache.stage().ok()?;
-        let file = File::from_std(stage.reopen().ok()?);
-        Some(Self {
-            reservation,
-            stage,
-            file,
-            span,
-        })
-    }
-
-    async fn commit(mut self, key: &str, metadata: &Arc<Metadata>) {
-        if self.file.flush().await.is_err() {
-            return;
-        }
-        drop(self.file.into_std().await);
-        let metadata = metadata.clone();
-        let key = key.to_owned();
-        let _ = tokio::task::spawn_blocking(move || {
-            self.reservation
-                .commit(self.stage, key, self.span, metadata)
-        })
-        .await;
-    }
 }
 
 fn partial_metadata(response: &Response<Incoming>) -> Result<(Range<u64>, Metadata)> {

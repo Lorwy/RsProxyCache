@@ -14,6 +14,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tokio::{fs::File as AsyncFile, io::AsyncWriteExt};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Metadata {
@@ -21,6 +22,18 @@ pub struct Metadata {
     pub size: u64,
     pub etag: Option<String>,
     pub content_type: Option<String>,
+}
+
+pub struct CacheVersion {
+    key: String,
+    metadata: Metadata,
+    id: u64,
+}
+
+impl CacheVersion {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -76,11 +89,12 @@ struct Index {
     entries: HashMap<String, Vec<Arc<Entry>>>,
     size: u64,
     reserved: u64,
-    versions: HashMap<String, Weak<Metadata>>,
+    versions: HashMap<String, Weak<CacheVersion>>,
+    next_version: u64,
     retired: Vec<(Weak<Entry>, u64)>,
 }
 
-pub struct Reservation {
+struct Reservation {
     cache: Arc<Cache>,
     size: u64,
 }
@@ -200,7 +214,7 @@ impl Cache {
         pieces
     }
 
-    pub fn reserve(self: &Arc<Self>, size: u64) -> Option<Reservation> {
+    fn reserve(self: &Arc<Self>, size: u64) -> Option<Reservation> {
         if size == 0 || size > self.capacity {
             return None;
         }
@@ -219,20 +233,48 @@ impl Cache {
         })
     }
 
-    pub fn max_interval_size(&self) -> u64 {
-        self.capacity.min(1024 * 1024)
+    pub fn writer(
+        self: &Arc<Self>,
+        version: Arc<CacheVersion>,
+        span: Range<u64>,
+    ) -> Option<IntervalWriter> {
+        let chunk_size = if version.metadata.etag.is_some() {
+            self.capacity.min(1024 * 1024)
+        } else {
+            span.end - span.start
+        };
+        (chunk_size > 0).then(|| IntervalWriter {
+            cache: self.clone(),
+            version,
+            chunk_size,
+            end: span.end,
+            next: span.start,
+            chunk_end: span.start,
+            chunk: None,
+        })
     }
 
-    pub fn stage(&self) -> Result<tempfile::NamedTempFile> {
+    pub fn is_current(&self, version: &Arc<CacheVersion>) -> bool {
+        self.index.lock().unwrap().is_current(version)
+    }
+
+    pub fn invalidate(&self, version: &Arc<CacheVersion>) {
+        let mut index = self.index.lock().unwrap();
+        if index.is_current(version) {
+            index.clear(&version.key);
+        }
+    }
+
+    fn stage(&self) -> Result<tempfile::NamedTempFile> {
         Ok(tempfile::Builder::new()
             .prefix(".rpc-stage-")
             .tempfile_in(&self.dir)?)
     }
 
-    pub fn adopt(&self, key: &str, metadata: Metadata) -> Arc<Metadata> {
+    pub fn adopt(&self, key: &str, metadata: Metadata) -> Arc<CacheVersion> {
         let mut index = self.index.lock().unwrap();
         if let Some(active) = index.active(key)
-            && *active == metadata
+            && active.metadata == metadata
         {
             return active;
         }
@@ -247,10 +289,10 @@ impl Cache {
         index.set_version(key, metadata)
     }
 
-    pub fn patch_version(&self, key: &str, metadata: &Metadata) -> Option<Arc<Metadata>> {
+    pub fn version_for_patch(&self, key: &str, metadata: &Metadata) -> Option<Arc<CacheVersion>> {
         let mut index = self.index.lock().unwrap();
         if let Some(active) = index.active(key) {
-            return (*active == *metadata).then_some(active);
+            return (active.metadata == *metadata).then_some(active);
         }
         let last = index.entries.get(key)?.last()?;
         (last.record.metadata == *metadata).then(|| index.set_version(key, metadata.clone()))
@@ -262,12 +304,11 @@ impl Cache {
 }
 
 impl Reservation {
-    pub fn commit(
+    fn commit(
         mut self,
         stage: tempfile::NamedTempFile,
-        key: String,
         span: Range<u64>,
-        version: Arc<Metadata>,
+        version: Arc<CacheVersion>,
     ) -> Result<()> {
         let name = stage
             .path()
@@ -279,9 +320,9 @@ impl Reservation {
             .context("invalid staging prefix")?;
         let path = self.cache.dir.join(format!("rpc-{id}.data"));
         let record = Record {
-            key,
+            key: version.key.clone(),
             span,
-            metadata: (*version).clone(),
+            metadata: version.metadata.clone(),
         };
         ensure!(
             record.span.end - record.span.start == stage.as_file().metadata()?.len(),
@@ -293,10 +334,7 @@ impl Reservation {
         sidecar.flush()?;
         sidecar.as_file().sync_data()?;
         let mut index = self.cache.index.lock().unwrap();
-        if !index
-            .active(&record.key)
-            .is_some_and(|active| Arc::ptr_eq(&active, &version))
-        {
+        if !index.is_current(&version) {
             return Ok(());
         }
         stage.persist_noclobber(&path)?;
@@ -317,14 +355,24 @@ impl Reservation {
 }
 
 impl Index {
-    fn active(&self, key: &str) -> Option<Arc<Metadata>> {
+    fn active(&self, key: &str) -> Option<Arc<CacheVersion>> {
         self.versions.get(key)?.upgrade()
     }
 
-    fn set_version(&mut self, key: &str, metadata: Metadata) -> Arc<Metadata> {
+    fn is_current(&self, version: &Arc<CacheVersion>) -> bool {
+        self.active(&version.key)
+            .is_some_and(|active| Arc::ptr_eq(&active, version))
+    }
+
+    fn set_version(&mut self, key: &str, metadata: Metadata) -> Arc<CacheVersion> {
         self.versions
             .retain(|_, version| version.strong_count() > 0);
-        let version = Arc::new(metadata);
+        let version = Arc::new(CacheVersion {
+            key: key.to_owned(),
+            metadata,
+            id: self.next_version,
+        });
+        self.next_version += 1;
         self.versions
             .insert(key.to_owned(), Arc::downgrade(&version));
         version
@@ -433,5 +481,78 @@ fn remove(path: &Path) {
         && error.kind() != std::io::ErrorKind::NotFound
     {
         eprintln!("cache cleanup failed: {error}");
+    }
+}
+
+pub struct IntervalWriter {
+    cache: Arc<Cache>,
+    version: Arc<CacheVersion>,
+    chunk_size: u64,
+    end: u64,
+    next: u64,
+    chunk_end: u64,
+    chunk: Option<StagedInterval>,
+}
+
+impl IntervalWriter {
+    pub async fn write(&mut self, mut data: &[u8]) {
+        while !data.is_empty() {
+            if self.next == self.chunk_end {
+                self.chunk_end = self.next.saturating_add(self.chunk_size).min(self.end);
+                self.chunk = StagedInterval::new(&self.cache, self.next..self.chunk_end);
+            }
+            let size = (self.chunk_end - self.next).min(data.len() as u64) as usize;
+            if let Some(chunk) = &mut self.chunk
+                && chunk.file.write_all(&data[..size]).await.is_err()
+            {
+                self.chunk = None;
+            }
+            self.next += size as u64;
+            data = &data[size..];
+            if self.next == self.chunk_end
+                && self.next != self.end
+                && let Some(chunk) = self.chunk.take()
+            {
+                chunk.commit(self.version.clone()).await;
+            }
+        }
+    }
+
+    pub async fn finish(self) {
+        if let Some(chunk) = self.chunk {
+            chunk.commit(self.version).await;
+        }
+    }
+}
+
+struct StagedInterval {
+    reservation: Reservation,
+    stage: tempfile::NamedTempFile,
+    file: AsyncFile,
+    span: Range<u64>,
+}
+
+impl StagedInterval {
+    fn new(cache: &Arc<Cache>, span: Range<u64>) -> Option<Self> {
+        let reservation = cache.reserve(span.end - span.start)?;
+        let stage = cache.stage().ok()?;
+        let file = AsyncFile::from_std(stage.reopen().ok()?);
+        Some(Self {
+            reservation,
+            stage,
+            file,
+            span,
+        })
+    }
+
+    async fn commit(mut self, version: Arc<CacheVersion>) {
+        if self.file.flush().await.is_err() {
+            return;
+        }
+        drop(self.file.into_std().await);
+        let _ = tokio::task::spawn_blocking(move || {
+            self.reservation.commit(self.stage, self.span, version)
+        })
+        .await;
     }
 }

@@ -3,11 +3,7 @@ mod origin;
 mod playback;
 mod range;
 
-use std::{
-    collections::HashSet,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result, bail, ensure};
 use hyper::{server::conn::http1, service::service_fn};
@@ -53,11 +49,10 @@ async fn main() -> Result<()> {
         .parse::<bool>()
         .context("invalid RPC_ALLOW_PRIVATE_ORIGINS")?;
 
-    let playback = Arc::new(playback::Playback {
-        origin: origin::Origin::new(hosts, allow_private)?,
-        cache: cache::Cache::open(dir, capacity)?,
-        locks: Mutex::default(),
-    });
+    let playback = Arc::new(playback::Playback::new(
+        cache::Cache::open(dir, capacity)?,
+        origin::Origin::new(hosts, allow_private)?,
+    ));
     let listener = TcpListener::bind(setting("RPC_LISTEN", "127.0.0.1:8080")).await?;
     eprintln!("listening on {}", listener.local_addr()?);
     loop {

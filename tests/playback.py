@@ -47,6 +47,11 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_header("Location", f"http://localhost:{state.server_port}{SIGNED_PATH}")
             self.end_headers()
             return
+        if requested and requested == state.fail_range:
+            self.send_response(503)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if state.expired:
             self.send_error(403)
             return
@@ -78,13 +83,15 @@ class Origin(http.server.BaseHTTPRequestHandler):
             try:
                 if state.block_range and requested == state.block_range:
                     state.release_range.wait(5)
+                stop = (start + end) // 2 if state.truncate else end
+                with state.transfer_lock:
+                    written = self.wfile.write(data[start:stop])
+                    state.transfers.append((self.path, requested, written))
                 if state.truncate:
-                    self.wfile.write(data[start:(start + end) // 2])
                     self.close_connection = True
-                else:
-                    self.wfile.write(data[start:end])
             except (BrokenPipeError, ConnectionResetError):
                 pass
+
 
 
 class PlaybackTests(unittest.TestCase):
@@ -97,6 +104,9 @@ class PlaybackTests(unittest.TestCase):
         threading.Thread(target=origin.serve_forever, daemon=True).start()
         self.addCleanup(origin.shutdown)
         origin.requests = []
+        origin.transfers = []
+        origin.transfer_lock = threading.Lock()
+        origin.fail_range = None
         origin.data = bytes(range(200))
         origin.etag = '"one"'
         origin.expired = origin.ignore_range = origin.truncate = False
@@ -137,13 +147,19 @@ class PlaybackTests(unittest.TestCase):
                 headers_received.set()
             return response.status, response.headers, response.read()
 
+    def transfers(self):
+        with self.origin.transfer_lock:
+            return self.origin.transfers.copy()
+
     def test_ranges_hits_restart_expiry_and_clear(self):
         self.start()
         status, headers, body = self.get("80-99")
         self.assertEqual((status, headers["Content-Range"], body),
                          (206, "bytes 80-99/200", self.origin.data[80:100]))
         self.assertEqual(self.origin.requests, [("GET", SIGNED_PATH, "bytes=80-99")])
+        self.assertEqual(self.transfers(), [(SIGNED_PATH, "bytes=80-99", 20)])
         self.assertEqual(self.get("90-94")[2], self.origin.data[90:95])
+        self.assertEqual(self.transfers(), [(SIGNED_PATH, "bytes=80-99", 20)])
         self.assertEqual(self.get(method="HEAD")[1]["Content-Length"], "200")
         self.stop()
         self.origin.expired = True
@@ -164,11 +180,26 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(self.get("30-69")[2], self.origin.data[30:70])
         self.assertEqual([item[2] for item in self.origin.requests],
                          ["bytes=40-59", "bytes=30-39", "bytes=60-69"])
+        self.assertCountEqual(self.transfers(),
+                              [(SIGNED_PATH, "bytes=40-59", 20),
+                               (SIGNED_PATH, "bytes=30-39", 10),
+                               (SIGNED_PATH, "bytes=60-69", 10)])
         self.origin.etag = '"two"'
         self.origin.data = bytes(reversed(range(150)))
         self.assertEqual(self.get("40-199")[2], self.origin.data[40:])
         self.assertEqual(self.get("-10")[2], self.origin.data[-10:])
         self.assertEqual(len(self.origin.requests), 5)
+
+    def test_detected_replacement_invalidates_old_ranges_even_if_retry_fails(self):
+        self.start()
+        self.assertEqual(self.get("40-59")[0], 206)
+        self.origin.etag = '"two"'
+        self.origin.data = bytes(reversed(range(200)))
+        self.origin.fail_range = "bytes=40-69"
+        self.assertEqual(self.get("40-69")[0], 503)
+        self.assertEqual(self.get("40-59")[2], self.origin.data[40:60])
+        self.assertEqual([item[2] for item in self.origin.requests],
+                         ["bytes=40-59", "bytes=60-69", "bytes=40-69", "bytes=40-59"])
 
     def test_persistent_lru(self):
         self.start(capacity=40)
@@ -190,6 +221,50 @@ class PlaybackTests(unittest.TestCase):
             results = list(pool.map(self.get, ["40-59", "40-59"]))
         self.assertEqual([result[2] for result in results], [self.origin.data[40:60]] * 2)
         self.assertEqual(len(self.origin.requests), 1)
+
+    def test_different_playback_ranges_share_the_same_gap(self):
+        self.start()
+        self.get("0-39")
+        self.get("60-99")
+        self.origin.block_range = "bytes=40-59"
+        headers_received = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.get, "20-79", headers_received=headers_received)
+            try:
+                self.assertTrue(headers_received.wait(3))
+                second = pool.submit(self.get, "30-89")
+                with self.assertRaises(concurrent.futures.TimeoutError):
+                    second.result(timeout=0.2)
+                self.assertEqual([line[2] for line in self.origin.requests].count("bytes=40-59"), 1)
+            finally:
+                self.origin.release_range.set()
+            self.assertEqual(first.result(timeout=3)[2], self.origin.data[20:80])
+            self.assertEqual(second.result(timeout=3)[2], self.origin.data[30:90])
+        self.assertEqual([line for line in self.transfers() if line[1] == "bytes=40-59"],
+                         [(SIGNED_PATH, "bytes=40-59", 20)])
+
+    def test_failed_shared_gap_can_be_retried(self):
+        self.start()
+        self.get("0-39")
+        self.get("60-99")
+        self.origin.block_range = "bytes=40-59"
+        self.origin.truncate = True
+        headers_received = threading.Event()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(self.get, "20-79", headers_received=headers_received)
+            try:
+                self.assertTrue(headers_received.wait(3))
+                second = pool.submit(self.get, "30-89")
+                with self.assertRaises(concurrent.futures.TimeoutError):
+                    second.result(timeout=0.2)
+            finally:
+                self.origin.release_range.set()
+            with self.assertRaises(http.client.IncompleteRead):
+                first.result(timeout=3)
+            self.assertEqual(second.result(timeout=3)[0], 502)
+        self.assertEqual([line[2] for line in self.origin.requests].count("bytes=40-59"), 1)
+        self.origin.truncate = False
+        self.assertEqual(self.get("30-89")[2], self.origin.data[30:90])
 
     def test_seek_does_not_wait_for_existing_download(self):
         self.start()
