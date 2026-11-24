@@ -14,7 +14,7 @@ use anyhow::{Context, Result, ensure};
 use bytes::Bytes;
 use futures_util::stream;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};
-use http_body_util::{BodyExt, Full, StreamBody, combinators::UnsyncBoxBody};
+use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::UnsyncBoxBody};
 use hyper::body::{Frame, Incoming};
 use tokio::{
     fs::File,
@@ -26,8 +26,9 @@ use tokio::{
 use tracing::Instrument;
 
 use crate::{
-    cache::{self, Cache, CacheVersion, Entry, IntervalWriter, Metadata, Piece},
-    origin::{FinalTarget, Origin, TIMEOUT},
+    cache::{self, Cache, CacheVersion, Entry, IntervalWriter, Metadata, Piece, WholeWriter},
+    hls::{self, Resource},
+    origin::{FinalTarget, FinalUrl, Origin, TIMEOUT},
     range::{self, Requested},
 };
 
@@ -40,6 +41,11 @@ pub struct Playback {
     pub(crate) signing_key: Option<ring::hmac::Key>,
     request_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     gaps: Mutex<HashMap<GapKey, Weak<GapFlight>>>,
+}
+
+enum BodyWriter {
+    Interval(IntervalWriter),
+    Whole(WholeWriter),
 }
 
 enum Prepared {
@@ -58,6 +64,11 @@ enum Part {
         span: Range<u64>,
         version: Option<Arc<CacheVersion>>,
         flight: Option<GapLeader>,
+    },
+    RemoteWhole {
+        body: Incoming,
+        length: Option<u64>,
+        writer: Option<Box<WholeWriter>>,
     },
     Passthrough {
         body: Incoming,
@@ -157,12 +168,13 @@ impl Playback {
         } else {
             source
         };
-        if self.origin.validate(source).is_err() {
+        let (resource, source) = Resource::from_path(source);
+        let Ok(uri) = self.origin.validate(source) else {
             return Ok(plain(
                 StatusCode::BAD_REQUEST,
                 "invalid or disallowed source URL",
             ));
-        }
+        };
         let head = request.method() == Method::HEAD;
         if !head && request.method() != Method::GET {
             let mut response = plain(StatusCode::METHOD_NOT_ALLOWED, "use GET or HEAD");
@@ -170,6 +182,19 @@ impl Playback {
                 .headers_mut()
                 .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
             return Ok(response);
+        }
+        if resource == Some(Resource::Playlist)
+            || (resource.is_none() && hls::playlist_path(uri.path()))
+        {
+            let origin = self.origin.fetch(source, Method::GET, None).await?;
+            return self.playlist(origin, head).await;
+        }
+        if resource == Some(Resource::Key) {
+            let origin = self
+                .origin
+                .fetch(source, request.method().clone(), None)
+                .await?;
+            return self.key(origin, head).await;
         }
         let requested = if head {
             Requested::Whole
@@ -200,6 +225,13 @@ impl Playback {
                 return media_response(requested, 0..metadata.size, &metadata, empty());
             }
             let origin = self.origin.fetch(source, Method::HEAD, None).await?;
+            if resource.is_none()
+                && origin.status().is_success()
+                && hls::playlist_type(origin.headers())
+            {
+                let origin = self.origin.fetch(source, Method::GET, None).await?;
+                return self.playlist(origin, true).await;
+            }
             return relay_headers(origin.status(), origin.headers(), empty());
         }
 
@@ -235,6 +267,20 @@ impl Playback {
             origin = self.origin.fetch(source, Method::GET, None).await?;
         }
 
+        if resource.is_none()
+            && hls::playlist_type(origin.headers())
+            && origin.status().is_success()
+        {
+            if origin.status() == StatusCode::PARTIAL_CONTENT {
+                // A source can cap an open-ended Range response. Fetch the complete manifest.
+                let (span, metadata) = partial_metadata(&origin)?;
+                if span != (0..metadata.size) {
+                    origin = self.origin.fetch(source, Method::GET, None).await?;
+                }
+            }
+            return self.playlist(origin, false).await;
+        }
+
         match origin.status() {
             StatusCode::PARTIAL_CONTENT => {
                 let (span, metadata) = partial_metadata(&origin)?;
@@ -256,9 +302,23 @@ impl Playback {
                 identity(origin.headers())?;
                 let status = origin.status();
                 let headers = origin.headers().clone();
-                let part = Part::Passthrough {
-                    body: origin.into_body(),
-                    length: content_length(&headers)?,
+                let length = content_length(&headers)?;
+                let part = if resource == Some(Resource::Media) {
+                    let metadata = origin_metadata(&origin, length.unwrap_or_default())?;
+                    let writer = self
+                        .cache
+                        .whole_writer(key, metadata, length, generation)
+                        .map(Box::new);
+                    Part::RemoteWhole {
+                        body: origin.into_body(),
+                        length,
+                        writer,
+                    }
+                } else {
+                    Part::Passthrough {
+                        body: origin.into_body(),
+                        length,
+                    }
                 };
                 let body = self.stream(vec![part], guard, None);
                 relay_headers(status, &headers, body)
@@ -269,6 +329,71 @@ impl Playback {
             }
             _ => anyhow::bail!("unexpected origin response"),
         }
+    }
+
+    async fn key(&self, origin: Response<Incoming>, head: bool) -> Result<Response<Body>> {
+        let status = origin.status();
+        let headers = origin.headers().clone();
+        let body = if status.is_success() {
+            ensure!(status == StatusCode::OK, "unexpected HLS key status");
+            identity(&headers)?;
+            ensure!(
+                content_length(&headers)?.is_none_or(|length| length == 16),
+                "invalid AES-128 key length"
+            );
+            if head {
+                empty()
+            } else {
+                let bytes = collect_limited(origin.into_body(), 16).await?;
+                ensure!(bytes.len() == 16, "invalid AES-128 key length");
+                full(bytes)
+            }
+        } else {
+            empty()
+        };
+        let mut response = relay_headers(status, &headers, body)?;
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        Ok(response)
+    }
+
+    async fn playlist(&self, origin: Response<Incoming>, head: bool) -> Result<Response<Body>> {
+        if !origin.status().is_success() {
+            return relay_headers(origin.status(), origin.headers(), empty());
+        }
+        identity(origin.headers())?;
+        if origin.status() == StatusCode::PARTIAL_CONTENT {
+            let (span, metadata) = partial_metadata(&origin)?;
+            ensure!(span == (0..metadata.size), "incomplete HLS playlist");
+        } else {
+            ensure!(
+                origin.status() == StatusCode::OK,
+                "unexpected HLS playlist status"
+            );
+        }
+        let base = url::Url::parse(
+            &origin
+                .extensions()
+                .get::<FinalUrl>()
+                .context("missing playlist URL")?
+                .0,
+        )?;
+        let body = collect_limited(origin.into_body(), hls::MAX_PLAYLIST_BYTES).await?;
+        let playlist = hls::rewrite(std::str::from_utf8(&body)?, |resource, reference| {
+            let source = hls::resolve(&base, reference)?;
+            self.origin.validate(&source)?;
+            let path = format!("hls/{}/{source}", resource.name());
+            Ok(match &self.signing_key {
+                Some(key) => format!("/v1/{}", crate::mobile::sign(key, &path)),
+                None => format!("/v1/{path}"),
+            })
+        })?;
+        Ok(Response::builder()
+            .header(header::CONTENT_TYPE, "application/vnd.apple.mpegurl")
+            .header(header::CONTENT_LENGTH, playlist.len())
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(if head { empty() } else { full(playlist.into()) })?)
     }
 
     async fn lock(&self, key: &str) -> OwnedMutexGuard<()> {
@@ -482,7 +607,7 @@ impl Playback {
                     } => {
                         let length = span.end - span.start;
                         let writer = version.and_then(|version| playback.cache.writer(version, span));
-                        let result = send_remote(&sender, body, Some(length), writer).await;
+                        let result = send_remote(&sender, body, Some(length), writer.map(BodyWriter::Interval)).await;
                         if let Some(flight) = flight {
                             flight.finish(if result.is_ok() {
                                 GapOutcome::Ready
@@ -491,6 +616,9 @@ impl Playback {
                             });
                         }
                         result
+                    }
+                    Part::RemoteWhole { body, length, writer } => {
+                        send_remote(&sender, body, length, writer.map(|writer| BodyWriter::Whole(*writer))).await
                     }
                     Part::Passthrough { body, length } => {
                         send_remote(&sender, body, length, None).await
@@ -542,7 +670,13 @@ impl Playback {
             .cache
             .version_for_patch(&cache::key(source), metadata)
             .and_then(|version| self.cache.writer(version, span));
-        send_remote(sender, response.into_body(), Some(length), writer).await
+        send_remote(
+            sender,
+            response.into_body(),
+            Some(length),
+            writer.map(BodyWriter::Interval),
+        )
+        .await
     }
 }
 
@@ -571,7 +705,7 @@ async fn send_remote(
     sender: &Sender,
     mut body: Incoming,
     length: Option<u64>,
-    mut writer: Option<IntervalWriter>,
+    mut writer: Option<BodyWriter>,
 ) -> Result<()> {
     let mut received = 0_u64;
     let mut last = None;
@@ -594,8 +728,14 @@ async fn send_remote(
             length.is_none_or(|length| received <= length),
             "origin exceeded declared length"
         );
-        if let Some(writer) = &mut writer {
-            writer.write(&data).await;
+        match &mut writer {
+            Some(BodyWriter::Interval(writer)) => writer.write(&data).await,
+            Some(BodyWriter::Whole(whole)) => {
+                if whole.write(&data).await.is_none() {
+                    writer = None;
+                }
+            }
+            None => {}
         }
         // Hold the final bytes until length is verified and the completed interval is published.
         if length == Some(received) {
@@ -608,8 +748,10 @@ async fn send_remote(
         length.is_none_or(|length| received == length),
         "origin ended early"
     );
-    if let Some(writer) = writer {
-        writer.finish().await;
+    match writer {
+        Some(BodyWriter::Interval(writer)) => writer.finish().await,
+        Some(BodyWriter::Whole(writer)) => writer.finish().await,
+        None => {}
     }
     if let Some(last) = last {
         sender.send(Ok(Frame::data(last))).await?;
@@ -619,10 +761,6 @@ async fn send_remote(
 
 fn partial_metadata(response: &Response<Incoming>) -> Result<(Range<u64>, Metadata)> {
     let headers = response.headers();
-    let target = response
-        .extensions()
-        .get::<FinalTarget>()
-        .context("missing origin target")?;
     identity(headers)?;
     let (span, size) = headers
         .get(header::CONTENT_RANGE)
@@ -633,6 +771,15 @@ fn partial_metadata(response: &Response<Incoming>) -> Result<(Range<u64>, Metada
         content_length(headers)?.is_none_or(|length| length == span.end - span.start),
         "invalid origin length"
     );
+    Ok((span, origin_metadata(response, size)?))
+}
+
+fn origin_metadata(response: &Response<Incoming>, size: u64) -> Result<Metadata> {
+    let headers = response.headers();
+    let target = response
+        .extensions()
+        .get::<FinalTarget>()
+        .context("missing origin target")?;
     let etag = headers
         .get(header::ETAG)
         .and_then(|value| value.to_str().ok())
@@ -647,15 +794,19 @@ fn partial_metadata(response: &Response<Incoming>) -> Result<(Range<u64>, Metada
         .get(header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    Ok((
-        span,
-        Metadata {
-            target: target.0.clone(),
-            size,
-            etag,
-            content_type,
-        },
-    ))
+    Ok(Metadata {
+        target: target.0.clone(),
+        size,
+        etag,
+        content_type,
+    })
+}
+
+async fn collect_limited(body: Incoming, limit: usize) -> Result<Bytes> {
+    Ok(timeout(TIMEOUT, Limited::new(body, limit).collect())
+        .await?
+        .map_err(anyhow::Error::from_boxed)?
+        .to_bytes())
 }
 
 fn content_length(headers: &HeaderMap) -> Result<Option<u64>> {

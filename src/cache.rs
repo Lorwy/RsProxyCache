@@ -314,18 +314,43 @@ impl Cache {
         if !self.refresh_index(&mut index) || !index.is_current(version) {
             return None;
         }
-        let remaining = self
-            .capacity
-            .checked_sub(size.checked_add(index.reserved)?)?;
-        index.evict(remaining);
-        if index.size > remaining {
-            return None;
-        }
-        index.reserved += size;
+        index.reserve(self.capacity, size)?;
         Some(Reservation {
             cache: self.clone(),
             size,
             generation: index.generation,
+        })
+    }
+
+    pub(crate) fn whole_writer(
+        self: &Arc<Self>,
+        key: String,
+        metadata: Metadata,
+        length: Option<u64>,
+        generation: u64,
+    ) -> Option<WholeWriter> {
+        if self.capacity == 0 || length.is_some_and(|length| length == 0 || length > self.capacity)
+        {
+            return None;
+        }
+        let mut index = self.index.lock().unwrap();
+        if !self.refresh_index(&mut index) || index.generation != generation {
+            return None;
+        }
+        let stage = self
+            .stage_file()
+            .inspect_err(|error| cache_warning("stage_media", error))
+            .ok()?;
+        drop(index);
+        let reservation = Reservation {
+            cache: self.clone(),
+            size: 0,
+            generation,
+        };
+        Some(WholeWriter {
+            key,
+            metadata,
+            data: StagedInterval::open(reservation, stage, 0..0).ok()?,
         })
     }
 
@@ -366,10 +391,13 @@ impl Cache {
         if !self.refresh_index(&mut index) || !index.is_current(version) {
             return Ok(None);
         }
+        self.stage_file().map(Some)
+    }
+
+    fn stage_file(&self) -> Result<tempfile::NamedTempFile> {
         Ok(tempfile::Builder::new()
             .prefix(".rpc-stage-")
-            .tempfile_in(&self.dir)
-            .map(Some)?)
+            .tempfile_in(&self.dir)?)
     }
 
     pub fn adopt(
@@ -520,6 +548,16 @@ impl Index {
             .push(Arc::new(entry));
     }
 
+    fn reserve(&mut self, capacity: u64, size: u64) -> Option<()> {
+        let remaining = capacity.checked_sub(size.checked_add(self.reserved)?)?;
+        self.evict(remaining);
+        if self.size > remaining {
+            return None;
+        }
+        self.reserved += size;
+        Some(())
+    }
+
     fn evict(&mut self, capacity: u64) {
         self.retired.retain(|(entry, size)| {
             if entry.strong_count() > 0 {
@@ -653,6 +691,48 @@ impl IntervalWriter {
     }
 }
 
+pub(crate) struct WholeWriter {
+    key: String,
+    metadata: Metadata,
+    data: StagedInterval,
+}
+
+impl WholeWriter {
+    pub(crate) async fn write(&mut self, bytes: &[u8]) -> Option<()> {
+        let reservation = &mut self.data.reservation;
+        let cache = &reservation.cache;
+        {
+            let mut index = cache.index.lock().unwrap();
+            if !cache.refresh_index(&mut index) || reservation.generation != index.generation {
+                return None;
+            }
+            index.reserve(cache.capacity, bytes.len() as u64)?;
+            reservation.size += bytes.len() as u64;
+        }
+        self.data
+            .file
+            .write_all(bytes)
+            .await
+            .inspect_err(|error| cache_warning("write_media", error))
+            .ok()?;
+        self.data.span.end = reservation.size;
+        Some(())
+    }
+
+    pub(crate) async fn finish(mut self) {
+        let reservation = &self.data.reservation;
+        self.metadata.size = reservation.size;
+        if self.metadata.size > 0
+            && let Some(version) =
+                reservation
+                    .cache
+                    .adopt(&self.key, self.metadata, reservation.generation)
+        {
+            self.data.commit(version).await;
+        }
+    }
+}
+
 struct StagedInterval {
     reservation: Reservation,
     stage: tempfile::NamedTempFile,
@@ -667,13 +747,18 @@ impl StagedInterval {
             .stage(version)
             .inspect_err(|error| cache_warning("stage_interval", error))
             .ok()??;
-        let file = AsyncFile::from_std(
-            stage
-                .reopen()
-                .inspect_err(|error| cache_warning("open_staging_file", error))
-                .ok()?,
-        );
-        Some(Self {
+        Self::open(reservation, stage, span)
+            .inspect_err(|error| cache_warning("open_staging_file", error))
+            .ok()
+    }
+
+    fn open(
+        reservation: Reservation,
+        stage: tempfile::NamedTempFile,
+        span: Range<u64>,
+    ) -> Result<Self> {
+        let file = AsyncFile::from_std(stage.reopen()?);
+        Ok(Self {
             reservation,
             stage,
             file,

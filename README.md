@@ -1,10 +1,12 @@
 # RsProxyCache
 
-用 Rust 实现的单文件视频代理缓存。播放器把完整源地址拼在代理的 `/v1/` 后面即可播放：
+用 Rust 实现的单文件视频和 HLS 点播代理缓存。播放器把完整源地址拼在代理的 `/v1/` 后面即可播放：
 
 ```text
 http://127.0.0.1:8080/v1/https://media.example.com/video.mp4?token=a%2Fb&expires=123
 ```
+
+HLS 点播使用同一入口，例如 `/v1/https://media.example.com/movie.m3u8`。入口可通过 `.m3u8` 后缀或源站 HLS 内容类型识别。将主列表、子列表、媒体数据和密钥涉及的所有源站域名加入允许列表。
 
 ## 启动
 
@@ -28,7 +30,8 @@ RPC_ORIGIN_HOSTS=media.example.com,cdn.example.com cargo run --release --locked
 ## 缓存行为
 
 - 支持无 Range 的渐进式 `GET`、单字节区间 `GET` 和 `HEAD`。源站忽略播放器的 Range 请求时返回 `502`。
-- 完整命中直接读取磁盘，源站离线或签名过期时仍可读取。更新签名会使用独立的缓存条目。
+- 完整命中的媒体数据直接从磁盘读取。更换签名会使用独立的缓存条目。
+- HLS 播放列表和标准 AES-128 密钥按请求回源。MPEG-TS、fMP4 初始化数据和媒体分片与单文件视频共享缓存容量和 LRU。播放器可按主播放列表选择码率、音轨和字幕。
 - 缓存无 TTL，跨重启保留，容量不足时按全局 LRU 淘汰区间。补齐缺口时，只有源站目标和强 `ETag` 一致才合并字节。
 - 同一视频版本、同一缺失区间的并发请求共享回源，下载成功后从缓存读取该区间。缓存容量不足或写入失败时，等待的请求可能再次回源。
 
@@ -51,7 +54,7 @@ cargo build --locked
 python3 tests/playback.py -v
 ```
 
-测试使用本机回环接口和临时缓存目录。系统安装了 FFmpeg 时，还会生成真实 MP4，经代理验证解码、跳转与源地址保真。实际播放器的接入验收见 [首版播放验收](docs/playback-acceptance.md)。
+测试使用本机回环接口和临时缓存目录。系统安装了 FFmpeg 时，还会生成真实 MP4、MPEG-TS HLS 和 fMP4 HLS，经代理验证解码与跳转。实际播放器的接入验收见 [首版播放验收](docs/playback-acceptance.md)。
 
 ## 移动端 SDK
 

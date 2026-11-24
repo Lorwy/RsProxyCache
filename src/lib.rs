@@ -1,4 +1,5 @@
 pub mod cache;
+mod hls;
 pub mod origin;
 pub mod playback;
 mod range;

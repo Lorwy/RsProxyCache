@@ -60,6 +60,14 @@ fn playback_url(source: &str) -> Result<String> {
     ensure!(!instance.server.is_finished(), "proxy stopped unexpectedly");
     instance.playback.origin.validate(source)?;
     let key = instance.playback.signing_key.as_ref().unwrap();
+    Ok(format!(
+        "http://127.0.0.1:{}/v1/{}",
+        instance.port,
+        sign(key, source)
+    ))
+}
+
+pub(crate) fn sign(key: &hmac::Key, source: &str) -> String {
     let tag = hmac::sign(key, source.as_bytes());
     let signature = tag
         .as_ref()
@@ -69,10 +77,7 @@ fn playback_url(source: &str) -> Result<String> {
             write!(text, "{byte:02x}").unwrap();
             text
         });
-    Ok(format!(
-        "http://127.0.0.1:{}/v1/{signature}/{source}",
-        instance.port
-    ))
+    format!("{signature}/{source}")
 }
 
 pub(crate) fn verify<'a>(key: &hmac::Key, path: &'a str) -> Option<&'a str> {

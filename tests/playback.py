@@ -56,6 +56,12 @@ class Origin(http.server.BaseHTTPRequestHandler):
             self.send_error(403)
             return
 
+        if self.path in state.redirects:
+            self.send_response(302)
+            self.send_header("Location", state.redirects[self.path])
+            self.end_headers()
+            return
+        content_type, data = state.resources.get(self.path, ("video/mp4", data))
         total = len(data)
         status, start, end = 200, 0, total
         if requested and not state.ignore_range:
@@ -70,8 +76,9 @@ class Origin(http.server.BaseHTTPRequestHandler):
             status = 206
 
         self.send_response(status)
-        self.send_header("Content-Type", "video/mp4")
-        self.send_header("Content-Length", str(end - start))
+        self.send_header("Content-Type", content_type)
+        if self.path not in state.unsized:
+            self.send_header("Content-Length", str(end - start))
         if etag is not None:
             self.send_header("ETag", etag)
         if status == 206:
@@ -103,6 +110,9 @@ class PlaybackTests(unittest.TestCase):
         self.addCleanup(origin.server_close)
         threading.Thread(target=origin.serve_forever, daemon=True).start()
         self.addCleanup(origin.shutdown)
+        origin.unsized = set()
+        origin.resources = {}
+        origin.redirects = {}
         origin.requests = []
         origin.transfers = []
         origin.transfer_lock = threading.Lock()
@@ -142,10 +152,10 @@ class PlaybackTests(unittest.TestCase):
             self.proxy = None
             return logs.decode()
 
-    def get(self, spec=None, path=SIGNED_PATH, method="GET", headers_received=None):
+    def get(self, spec=None, path=SIGNED_PATH, method="GET", headers_received=None, proxy_path=None):
         headers = {"Range": f"bytes={spec}"} if spec is not None else {}
         with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)) as conn:
-            conn.request(method, "/v1/" + self.source + path, headers=headers)
+            conn.request(method, proxy_path or "/v1/" + self.source + path, headers=headers)
             response = conn.getresponse()
             if headers_received is not None:
                 headers_received.set()
@@ -154,6 +164,168 @@ class PlaybackTests(unittest.TestCase):
     def transfers(self):
         with self.origin.transfer_lock:
             return self.origin.transfers.copy()
+
+    def test_hls_rewrites_redirected_playlist_using_final_url(self):
+        self.start()
+        self.origin.redirects["/stream"] = "/media/entry"
+        self.origin.resources["/media/entry"] = (
+            "application/vnd.apple.mpegurl",
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nclip.ts?sig=a%2Fb&z=2\n#EXT-X-ENDLIST\n",
+        )
+        self.origin.resources["/media/clip.ts?sig=a%2Fb&z=2"] = ("video/mp2t", b"segment")
+        status, headers, body = self.get(path="/stream")
+        self.assertEqual((status, headers["Content-Type"]), (200, "application/vnd.apple.mpegurl"))
+        segment = body.decode().splitlines()[3]
+        self.assertTrue(segment.startswith("/"))
+        self.assertEqual(self.get(proxy_path=segment)[2], b"segment")
+
+    def test_hls_master_routes_variants_audio_and_subtitles_through_proxy(self):
+        self.start()
+        self.origin.resources["/master.m3u8"] = ("text/plain", b"""#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English, stereo",URI="audio"
+#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",URI="subs"
+#EXT-X-STREAM-INF:BANDWIDTH=100000,AUDIO="audio",SUBTITLES="subs"
+low
+#EXT-X-STREAM-INF:BANDWIDTH=500000,AUDIO="audio",SUBTITLES="subs"
+high
+""")
+        for rendition in ("audio", "subs", "low", "high"):
+            self.origin.resources[f"/{rendition}"] = (
+                "text/plain",
+                f"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n{rendition}.bin\n#EXT-X-ENDLIST\n".encode(),
+            )
+        status, _, body = self.get(path="/master.m3u8")
+        self.assertEqual(status, 200)
+        lines = body.decode().splitlines()
+        self.assertIn('NAME="English, stereo"', lines[1])
+        urls = re.findall(r'URI="([^"]+)"', body.decode()) + [lines[4], lines[6]]
+        for url, rendition in zip(urls, ("audio", "subs", "low", "high"), strict=True):
+            status, _, playlist = self.get(proxy_path=url)
+            self.assertEqual(status, 200)
+            self.assertIn(f"/{rendition}.bin".encode(), playlist)
+
+    def test_hls_fmp4_ranges_and_aes_key_use_their_own_cache_policies(self):
+        self.start()
+        self.origin.resources["/movie.m3u8"] = ("text/plain", b"""#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:4
+#EXT-X-MAP:URI="shared.mp4",BYTERANGE="4@0"
+#EXT-X-KEY:METHOD=AES-128,URI="key?sig=x%2Fy",IV=0x00000000000000000000000000000001
+#EXTINF:4,
+#EXT-X-BYTERANGE:6@4
+shared.mp4
+#EXT-X-ENDLIST
+""")
+        self.origin.resources["/shared.mp4"] = ("video/mp4", b"initabcdef")
+        self.origin.resources["/key?sig=x%2Fy"] = ("application/octet-stream", b"0123456789abcdef")
+
+        def play():
+            status, _, body = self.get(path="/movie.m3u8")
+            self.assertEqual(status, 200)
+            init, key = re.findall(r'URI="([^"]+)"', body.decode())
+            segment = body.decode().splitlines()[-2]
+            self.assertEqual(init, segment)
+            self.assertEqual(self.get("0-3", proxy_path=init)[2], b"init")
+            self.assertEqual(self.get("4-9", proxy_path=segment)[2], b"abcdef")
+            return self.get(proxy_path=key)[2]
+
+        self.assertEqual(play(), b"0123456789abcdef")
+        self.stop()
+        self.start()
+        self.origin.resources["/key?sig=x%2Fy"] = ("application/octet-stream", b"fedcba9876543210")
+        self.origin.requests.clear()
+        self.assertEqual(play(), b"fedcba9876543210")
+        self.assertEqual(self.origin.requests, [
+            ("GET", "/movie.m3u8", None), ("GET", "/key?sig=x%2Fy", None),
+        ])
+
+    def test_hls_whole_segments_are_reused_when_origin_ignores_ranges(self):
+        self.start()
+        self.origin.ignore_range = True
+        self.origin.unsized.add("/unsized.ts")
+        self.origin.resources["/movie.m3u8"] = ("text/plain", b"""#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXTINF:4,
+clip.ts
+#EXTINF:4,
+unsized.ts
+#EXT-X-ENDLIST
+""")
+        self.origin.resources["/clip.ts"] = ("video/mp2t", b"known-length")
+        self.origin.resources["/unsized.ts"] = ("video/mp2t", b"unknown-length")
+        _, _, playlist = self.get(path="/movie.m3u8")
+        sized, unsized = (line for line in playlist.decode().splitlines() if line.startswith("/"))
+        self.assertEqual(self.get(proxy_path=sized)[2], b"known-length")
+        self.assertEqual(self.get(proxy_path=unsized)[2], b"unknown-length")
+        self.stop()
+        self.start()
+        self.origin.expired = True
+        self.assertEqual(self.get(proxy_path=sized)[2], b"known-length")
+        self.assertEqual(self.get(proxy_path=unsized)[2], b"unknown-length")
+
+    def test_hls_truncated_whole_segment_is_not_reused(self):
+        self.start()
+        self.origin.ignore_range = True
+        self.origin.resources["/movie.m3u8"] = (
+            "text/plain",
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nclip.ts\n#EXT-X-ENDLIST\n",
+        )
+        self.origin.resources["/clip.ts"] = ("video/mp2t", b"old-segment")
+        _, _, playlist = self.get(path="/movie.m3u8")
+        segment = playlist.decode().splitlines()[-2]
+        self.origin.truncate = True
+        with self.assertRaises(http.client.IncompleteRead):
+            self.get(proxy_path=segment)
+        self.stop()
+        self.start()
+        self.origin.truncate = False
+        self.origin.resources["/clip.ts"] = ("video/mp2t", b"new-segment")
+        self.assertEqual(self.get(proxy_path=segment)[2], b"new-segment")
+
+    def test_hls_rejects_live_drm_and_disallowed_resource_urls(self):
+        self.start()
+        for name, tags, reference, end in (
+            ("live", b"", b"clip.ts", b""),
+            ("drm", b'#EXT-X-KEY:METHOD=SAMPLE-AES,URI="key"\n', b"clip.ts", b"#EXT-X-ENDLIST\n"),
+            ("host", b"", b"https://localhost/clip.ts", b"#EXT-X-ENDLIST\n"),
+            ("scheme", b"", b"file:///clip.ts", b"#EXT-X-ENDLIST\n"),
+        ):
+            with self.subTest(name=name):
+                path = f"/{name}.m3u8"
+                self.origin.resources[path] = (
+                    "application/vnd.apple.mpegurl",
+                    b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n" + tags + b"#EXTINF:4,\n" + reference + b"\n" + end,
+                )
+                self.assertEqual(self.get(path=path)[0], 502)
+
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is optional")
+    def test_ffmpeg_decodes_and_seeks_hls_ts_and_fmp4(self):
+        self.start(capacity=8 * 1024 * 1024)
+        for segment_type in ("mpegts", "fmp4"):
+            with self.subTest(segment_type=segment_type):
+                directory = Path(self.root) / segment_type
+                directory.mkdir()
+                subprocess.run([
+                    "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    "testsrc2=size=160x90:rate=10", "-t", "6", "-c:v", "libx264",
+                    "-g", "10", "-sc_threshold", "0", "-hls_time", "1",
+                    "-hls_playlist_type", "vod", "-hls_segment_type", segment_type,
+                    str(directory / "movie.m3u8"),
+                ], check=True, timeout=20)
+                for asset in directory.iterdir():
+                    self.origin.resources[f"/{segment_type}/{asset.name}"] = (
+                        "application/vnd.apple.mpegurl" if asset.suffix == ".m3u8"
+                        else "video/mp2t" if asset.suffix == ".ts" else "video/mp4",
+                        asset.read_bytes(),
+                    )
+                url = f"http://127.0.0.1:{self.port}/v1/{self.source}/{segment_type}/movie.m3u8"
+                decoded = subprocess.run([
+                    "ffmpeg", "-v", "error", "-ss", "4", "-i", url,
+                    "-frames:v", "4", "-f", "framehash", "-",
+                ], check=True, timeout=20, capture_output=True)
+                self.assertEqual(len(re.findall(rb"(?m)^0,", decoded.stdout)), 4)
+                self.assertTrue(any(item[1].startswith(f"/{segment_type}/movie4")
+                                    for item in self.origin.requests))
 
     def test_ranges_hits_restart_expiry_and_clear(self):
         self.start()

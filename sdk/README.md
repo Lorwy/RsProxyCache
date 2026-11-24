@@ -1,6 +1,6 @@
 # RsProxyCache SDK
 
-组件在宿主 App 进程内运行，支持通过 HTTP Range 读取的单文件 MP4。一个进程启动一次代理，多个播放器可以共享它。请把缓存目录设置为 App 私有缓存目录，所有重定向目标也需要加入源站白名单。
+组件在宿主 App 进程内运行，支持通过 HTTP Range 读取的单文件 MP4 和 HLS 点播。一个进程启动一次代理，多个播放器可以共享它。请把缓存目录设置为 App 私有缓存目录，所有重定向目标也需要加入源站白名单。
 
 在后台线程进行代理启停。启动成功后才生成代理播放地址，并直接把返回值交给播放器。代理重启后用原始源地址重新生成地址。源地址和代理播放地址可能包含凭据，应避免写入日志。
 
@@ -32,11 +32,15 @@ player.prepare()
 player.play()
 ```
 
+Media3 播放 HLS 需要加入与播放器版本一致的 `media3-exoplayer-hls`。如果源地址没有 `.m3u8` 后缀，使用 `MediaItem.Builder().setUri(address).setMimeType(MimeTypes.APPLICATION_M3U8)` 传给播放器。HLS 的子列表、分片和密钥如果来自其他域名，也需在启动时配置其源站白名单。
+
 宿主关闭最后一个播放器后，可以在后台线程调用 `ProxyCache.close()`。组件抛出的启动或地址生成错误由宿主管理。播放中的请求错误通过播放器报告。
 
 ### Media3 验收
 
 `sdk/android/acceptance` 是使用该 AAR 的独立验收 App。用 Gradle 9.3.1 和 Android SDK 36 构建 `assembleDebug`，安装 APK，再通过 `PlaybackActivity` 的 `source` Intent 参数传入支持 Range 的 HTTPS MP4。验收 App 会起播并跳到中间位置，可观察 `RpcAcceptance` 日志。切到后台并返回验证恢复。传入 `--ez warm true` 可在起播前通过代理完整读取视频，测试视频需小于配置的缓存容量。确认落盘后断开模拟器外网、强制停止验收 App，再用同一源地址重新启动。重启时省略 `warm` 参数，观察播放器能否从缓存起播并跳转。
+
+HLS 使用相同的 `source` 参数。可加 `--ez hls true` 显式设置 Media3 的媒体类型，并加 `--ez verifyTracks true` 在跳转成功后切换到可用的其他视频、音轨和字幕轨道，通过 `EventLogger` 检查实际加载的格式。重启 App 检查分片复用时保留源站连接，播放列表和密钥仍需回源。
 
 ## iOS
 

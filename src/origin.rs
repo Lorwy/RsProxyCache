@@ -25,6 +25,9 @@ pub const TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Clone)]
 pub struct FinalTarget(pub String);
 
+#[derive(Clone)]
+pub(crate) struct FinalUrl(pub String);
+
 pub struct Origin {
     hosts: HashSet<String>,
     allow_private: bool,
@@ -95,6 +98,7 @@ impl Origin {
                 response
                     .extensions_mut()
                     .insert(FinalTarget(crate::cache::key(&source)));
+                response.extensions_mut().insert(FinalUrl(source));
                 return Ok(response);
             }
             let location = response
