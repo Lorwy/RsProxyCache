@@ -28,6 +28,24 @@ public final class ProxyCache {
 
     public static native void close();
 
+    /** Starts or joins an offline cache task and returns its JSON status. */
+    public static String startDownload(String source, long bandwidth) {
+        if (bandwidth < 0) throw new IllegalArgumentException("Negative HLS bandwidth");
+        String status = nativeDownloadStart(utf8(source), bandwidth);
+        if (status == null) throw new IllegalStateException("Proxy unavailable or source invalid or disallowed");
+        return status;
+    }
+
+    /** Returns the task's JSON status, or null if there is no task. */
+    public static String downloadProgress(String source) {
+        return nativeDownloadProgress(utf8(source));
+    }
+
+    /** Requests cancellation and returns the current JSON status, or null if there is no task. */
+    public static String cancelDownload(String source) {
+        return nativeDownloadCancel(utf8(source));
+    }
+
     private static byte[] utf8(String value) {
         if (value.indexOf(0) >= 0) throw new IllegalArgumentException("Embedded NUL");
         return (value + "\0").getBytes(StandardCharsets.UTF_8);
@@ -35,4 +53,7 @@ public final class ProxyCache {
 
     private static native String nativeStart(byte[] directory, long capacity, byte[] hosts);
     private static native String nativePlaybackUrl(byte[] source);
+    private static native String nativeDownloadStart(byte[] source, long bandwidth);
+    private static native String nativeDownloadProgress(byte[] source);
+    private static native String nativeDownloadCancel(byte[] source);
 }

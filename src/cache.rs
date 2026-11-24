@@ -11,7 +11,11 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+use crate::hls;
+
+mod published;
 use anyhow::{Context, Result, ensure};
+use published::{covering_entries, publish_complete, publish_playlist};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{fs::File as AsyncFile, io::AsyncWriteExt};
@@ -24,7 +28,10 @@ pub struct Metadata {
     pub content_type: Option<String>,
 }
 
+const INTERNAL: &str = ".rpc";
+
 pub struct CacheVersion {
+    source: String,
     key: String,
     metadata: Metadata,
     id: u64,
@@ -38,30 +45,79 @@ impl CacheVersion {
 
 #[derive(Deserialize, Serialize)]
 struct Record {
+    source: String,
     key: String,
+    published: Option<PathBuf>,
+    modified: Option<SystemTime>,
+    playlist: Option<PublishedPlaylist>,
     span: Range<u64>,
     metadata: Metadata,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct PublishedPlaylist {
+    canonical: String,
+    original: String,
+    dependencies: Vec<PublishedDependency>,
+}
+
+#[derive(Clone, Deserialize, Serialize, Hash, Eq, PartialEq)]
+struct PublishedDependency {
+    key: String,
+    path: PathBuf,
 }
 
 pub struct Entry {
     record: Record,
     path: PathBuf,
+    sidecar: PathBuf,
     used: Mutex<SystemTime>,
     retired: AtomicBool,
 }
 
 impl Entry {
+    fn matches_published_file(&self) -> bool {
+        let Some(relative) = &self.record.published else {
+            return false;
+        };
+        if !self
+            .path
+            .ancestors()
+            .skip(1)
+            .take(relative.components().count() - 1)
+            .all(|path| fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()))
+        {
+            return false;
+        }
+        fs::symlink_metadata(&self.path).is_ok_and(|metadata| {
+            metadata.is_file()
+                && metadata.len() == self.size()
+                && metadata.modified().ok() == self.record.modified
+        })
+    }
+
     fn size(&self) -> u64 {
         self.record.span.end - self.record.span.start
     }
 
     fn open(&self, span: &Range<u64>) -> Result<(File, u64)> {
+        if self.record.published.is_some() {
+            ensure!(
+                self.matches_published_file(),
+                "published cache file changed"
+            );
+        }
         let file = File::open(&self.path)?;
         if !self.retired.load(Ordering::Acquire) {
-            fs::metadata(self.path.with_extension("json"))?;
+            fs::metadata(&self.sidecar)?;
         }
         ensure!(
-            file.metadata()?.len() == self.size(),
+            file.metadata()?.len() == self.size()
+                && self.record.modified.is_none_or(|time| file
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    == Some(time)),
             "invalid cache file length"
         );
         Ok((file, span.start - self.record.span.start))
@@ -70,7 +126,12 @@ impl Entry {
     pub fn touch(&self, file: &File) {
         let now = SystemTime::now();
         *self.used.lock().unwrap() = now;
-        if let Err(error) = file.set_modified(now) {
+        let result = if self.record.published.is_some() {
+            File::open(&self.sidecar).and_then(|file| file.set_modified(now))
+        } else {
+            file.set_modified(now)
+        };
+        if let Err(error) = result {
             cache_warning("update_interval_access_time", &error);
         }
     }
@@ -78,7 +139,7 @@ impl Entry {
 
 impl Drop for Entry {
     fn drop(&mut self) {
-        if *self.retired.get_mut() {
+        if *self.retired.get_mut() && self.record.published.is_none() {
             remove(&self.path);
         }
     }
@@ -105,6 +166,9 @@ struct Index {
     retired: Vec<(Weak<Entry>, u64)>,
     lease: Option<DirectoryLease>,
     generation: u64,
+    playlists: HashMap<String, (Instant, String)>,
+    pins: HashMap<String, usize>,
+    publishing: HashSet<u64>,
 }
 
 struct Reservation {
@@ -155,23 +219,32 @@ impl Cache {
             lease: Some(lease),
             ..Index::default()
         };
-        for item in fs::read_dir(dir)? {
+        let internal = dir.join(INTERNAL);
+        ensure_directory(&internal)?;
+        for item in fs::read_dir(&internal)? {
             let path = item?.path();
-            if path.extension().is_some_and(|ext| ext == "json") && owned(&path) {
-                match load(&path) {
-                    Ok(entry) => index.insert(entry),
+            if path.extension().is_some_and(|ext| ext == "json") {
+                match load(dir, &path) {
+                    Ok(entry) => {
+                        if let Some(playlist) = &entry.record.playlist
+                            && hls::is_master(&playlist.original)
+                        {
+                            index
+                                .remember_playlist(&entry.record.source, playlist.original.clone());
+                        }
+                        index.insert(entry);
+                    }
                     Err(_) => {
                         cache_warning("load_interval", &"invalid or unreadable cache record");
                         remove(&path);
-                        remove(&path.with_extension("data"));
+                        remove(&path.with_extension("part"));
                     }
                 }
             }
         }
-        for item in fs::read_dir(dir)? {
+        for item in fs::read_dir(&internal)? {
             let path = item?.path();
-            if (owned(&path)
-                && path.extension().is_some_and(|ext| ext == "data")
+            if (path.extension().is_some_and(|ext| ext == "part")
                 && !path.with_extension("json").is_file())
                 || path
                     .file_name()
@@ -180,8 +253,105 @@ impl Cache {
                 remove(&path);
             }
         }
+        let invalid: Vec<_> = index
+            .entries
+            .values()
+            .flatten()
+            .filter(|entry| {
+                entry.record.playlist.is_some()
+                    && !index.valid_published_graph(entry, &mut HashSet::new())
+            })
+            .map(|entry| entry.record.key.clone())
+            .collect();
+        for key in invalid {
+            index.clear(&key);
+        }
         index.evict(capacity);
         Ok(index)
+    }
+
+    pub(crate) fn capacity(&self) -> u64 {
+        self.capacity
+    }
+
+    pub(crate) fn pin(&self, key: String) {
+        let mut index = self.index.lock().unwrap();
+        self.refresh_index(&mut index);
+        *index.pins.entry(key).or_default() += 1;
+    }
+
+    pub(crate) fn unpin(&self, key: &str) {
+        let mut index = self.index.lock().unwrap();
+        if let Some(count) = index.pins.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                index.pins.remove(key);
+            }
+        }
+    }
+
+    pub(crate) fn contains(&self, source: &str, span: Option<Range<u64>>) -> bool {
+        let key = key(source);
+        let index = self.index.lock().unwrap();
+        match span {
+            Some(span) => index.entries.get(&key).is_some_and(|entries| {
+                entries
+                    .last()
+                    .and_then(|entry| covering_entries(entries, &entry.record.metadata, &span))
+                    .is_some_and(|covered| {
+                        covered.iter().all(|(entry, span)| entry.open(span).is_ok())
+                    })
+            }),
+            None => index
+                .published(&key)
+                .is_some_and(|entry| entry.matches_published_file()),
+        }
+    }
+
+    pub(crate) fn observe_playlist(&self, source: &str, canonical: String) {
+        let mut index = self.index.lock().unwrap();
+        if self.refresh_index(&mut index) {
+            index.remember_playlist(source, canonical);
+            index.publish_playlists(&self.dir, self.capacity);
+        }
+    }
+
+    pub(crate) fn published_playlist(&self, source: &str) -> Option<String> {
+        self.playlist_snapshot(source, false)
+    }
+
+    pub(crate) fn original_playlist(&self, source: &str) -> Option<String> {
+        self.playlist_snapshot(source, true)
+    }
+
+    fn playlist_snapshot(&self, source: &str, original: bool) -> Option<String> {
+        let mut index = self.index.lock().unwrap();
+        if !self.refresh_index(&mut index) {
+            return None;
+        }
+        let key = key(source);
+        let mut visited = HashSet::new();
+        let entry = index.published(&key)?;
+        let playlist = entry.record.playlist.as_ref()?;
+        if !index.valid_published_graph(entry, &mut visited) {
+            index.clear(&key);
+            return None;
+        }
+        for key in visited {
+            if let Some(entry) = index.published_at(&key.key, &key.path)
+                && let Ok(file) = File::open(&entry.path)
+            {
+                entry.touch(&file);
+            }
+        }
+        Some(
+            if original {
+                &playlist.original
+            } else {
+                &playlist.canonical
+            }
+            .clone(),
+        )
     }
 
     pub fn refresh(&self) -> u64 {
@@ -205,6 +375,7 @@ impl Cache {
         match Self::load_index(&self.dir, self.capacity) {
             Ok(mut recovered) => {
                 recovered.next_version = index.next_version;
+                recovered.pins = std::mem::take(&mut index.pins);
                 recovered.generation = index.generation + 1;
                 *index = recovered;
                 tracing::info!("cache directory recovered");
@@ -235,8 +406,9 @@ impl Cache {
                     index.entries.remove(key);
                 }
                 entry.retired.store(true, Ordering::Release);
-                remove(&entry.path.with_extension("json"));
+                remove(&entry.sidecar);
                 index.retired.push((Arc::downgrade(&entry), entry.size()));
+                index.clear_dependents(key);
             }
         })
     }
@@ -324,7 +496,7 @@ impl Cache {
 
     pub(crate) fn whole_writer(
         self: &Arc<Self>,
-        key: String,
+        source: String,
         metadata: Metadata,
         length: Option<u64>,
         generation: u64,
@@ -348,7 +520,7 @@ impl Cache {
             generation,
         };
         Some(WholeWriter {
-            key,
+            source,
             metadata,
             data: StagedInterval::open(reservation, stage, 0..0).ok()?,
         })
@@ -397,33 +569,34 @@ impl Cache {
     fn stage_file(&self) -> Result<tempfile::NamedTempFile> {
         Ok(tempfile::Builder::new()
             .prefix(".rpc-stage-")
-            .tempfile_in(&self.dir)?)
+            .tempfile_in(self.dir.join(INTERNAL))?)
     }
 
     pub fn adopt(
         &self,
-        key: &str,
+        source: &str,
         metadata: Metadata,
         generation: u64,
     ) -> Option<Arc<CacheVersion>> {
+        let key = key(source);
         let mut index = self.index.lock().unwrap();
         if !self.refresh_index(&mut index) || index.generation != generation {
             return None;
         }
-        if let Some(active) = index.active(key)
+        if let Some(active) = index.active(&key)
             && active.metadata == metadata
         {
             return Some(active);
         }
         if index
             .entries
-            .get(key)
+            .get(&key)
             .and_then(|entries| entries.last())
             .is_some_and(|entry| entry.record.metadata != metadata)
         {
-            index.clear(key);
+            index.clear(&key);
         }
-        Some(index.set_version(key, metadata))
+        Some(index.set_version(source, metadata))
     }
 
     pub fn version_for_patch(&self, key: &str, metadata: &Metadata) -> Option<Arc<CacheVersion>> {
@@ -432,11 +605,12 @@ impl Cache {
             return (active.metadata == *metadata).then_some(active);
         }
         let last = index.entries.get(key)?.last()?;
-        (last.record.metadata == *metadata).then(|| index.set_version(key, metadata.clone()))
+        let source = last.record.source.clone();
+        (last.record.metadata == *metadata).then(|| index.set_version(&source, metadata.clone()))
     }
 
     pub fn clear(&self, key: &str) {
-        self.index.lock().unwrap().clear(key);
+        self.index.lock().unwrap().clear_group(key);
         tracing::info!(cache_key = key, "cache cleared");
     }
 }
@@ -456,8 +630,13 @@ impl Reservation {
         let id = name
             .strip_prefix(".rpc-stage-")
             .context("invalid staging prefix")?;
-        let path = self.cache.dir.join(format!("rpc-{id}.data"));
+        let sidecar_path = self.cache.dir.join(INTERNAL).join(format!("{id}.json"));
+        let path = sidecar_path.with_extension("part");
         let record = Record {
+            source: version.source.clone(),
+            published: None,
+            modified: None,
+            playlist: None,
             key: version.key.clone(),
             span,
             metadata: version.metadata.clone(),
@@ -478,7 +657,7 @@ impl Reservation {
             return Ok(());
         }
         stage.persist_noclobber(&path)?;
-        if let Err(error) = sidecar.persist_noclobber(path.with_extension("json")) {
+        if let Err(error) = sidecar.persist_noclobber(&sidecar_path) {
             remove(&path);
             return Err(error.into());
         }
@@ -492,9 +671,18 @@ impl Reservation {
         index.insert(Entry {
             record,
             path,
+            sidecar: sidecar_path,
             used: Mutex::new(SystemTime::now()),
             retired: AtomicBool::new(false),
         });
+        drop(index);
+        if let Err(error) = publish_complete(&self.cache, &version) {
+            cache_warning("publish_media", &format_args!("{error:#}"));
+        }
+        let mut index = self.cache.index.lock().unwrap();
+        if self.cache.refresh_index(&mut index) {
+            index.publish_playlists(&self.cache.dir, self.cache.capacity);
+        }
         Ok(())
     }
 }
@@ -503,6 +691,7 @@ impl Index {
     fn reset(&mut self) {
         *self = Self {
             next_version: self.next_version,
+            pins: std::mem::take(&mut self.pins),
             generation: self.generation + 1,
             ..Self::default()
         };
@@ -517,27 +706,154 @@ impl Index {
             .is_some_and(|active| std::ptr::eq(active.as_ref(), version))
     }
 
-    fn set_version(&mut self, key: &str, metadata: Metadata) -> Arc<CacheVersion> {
+    fn set_version(&mut self, source: &str, metadata: Metadata) -> Arc<CacheVersion> {
         self.versions
             .retain(|_, version| version.strong_count() > 0);
+        let key = key(source);
         let version = Arc::new(CacheVersion {
-            key: key.to_owned(),
+            source: source.to_owned(),
+            key: key.clone(),
             metadata,
             id: self.next_version,
         });
         self.next_version += 1;
-        self.versions
-            .insert(key.to_owned(), Arc::downgrade(&version));
+        self.versions.insert(key, Arc::downgrade(&version));
         version
     }
 
+    fn clear_group(&mut self, key: &str) {
+        let dependencies = self
+            .published(key)
+            .and_then(|entry| entry.record.playlist.as_ref())
+            .map(|playlist| playlist.dependencies.clone())
+            .unwrap_or_default();
+        self.clear(key);
+        for dependency in dependencies {
+            let shared = self
+                .entries
+                .values()
+                .flatten()
+                .filter_map(|entry| entry.record.playlist.as_ref())
+                .any(|playlist| {
+                    playlist
+                        .dependencies
+                        .iter()
+                        .any(|item| item.key == dependency.key)
+                });
+            if !shared && !self.pins.contains_key(&dependency.key) {
+                self.clear_group(&dependency.key);
+            }
+        }
+    }
+
+    fn clear_dependents(&mut self, key: &str) {
+        let dependents: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|(_, entries)| {
+                entries.iter().any(|entry| {
+                    entry.record.playlist.as_ref().is_some_and(|playlist| {
+                        playlist.dependencies.iter().any(|item| item.key == key)
+                    })
+                })
+            })
+            .map(|(candidate, _)| candidate.clone())
+            .collect();
+        for dependent in dependents {
+            self.clear(&dependent);
+        }
+    }
+
     fn clear(&mut self, key: &str) {
+        let entries = self.entries.remove(key).unwrap_or_default();
+        self.clear_dependents(key);
         self.versions.remove(key);
-        for entry in self.entries.remove(key).unwrap_or_default() {
+        for entry in entries {
+            if entry.record.playlist.is_some() {
+                self.playlists.remove(&entry.record.source);
+            }
             entry.retired.store(true, Ordering::Release);
-            remove(&entry.path.with_extension("json"));
+            remove(&entry.sidecar);
+            if entry.record.published.is_some() && entry.matches_published_file() {
+                remove(&entry.path);
+            }
             self.retired.push((Arc::downgrade(&entry), entry.size()));
         }
+    }
+
+    fn published(&self, key: &str) -> Option<&Arc<Entry>> {
+        self.entries.get(key)?.iter().find(|entry| {
+            entry.record.published.is_some() && entry.record.span == (0..entry.record.metadata.size)
+        })
+    }
+
+    fn published_at(&self, key: &str, path: &Path) -> Option<&Arc<Entry>> {
+        self.entries
+            .get(key)?
+            .iter()
+            .find(|entry| entry.record.published.as_deref() == Some(path))
+    }
+
+    fn valid_published_graph(
+        &self,
+        entry: &Entry,
+        visited: &mut HashSet<PublishedDependency>,
+    ) -> bool {
+        let Some(path) = &entry.record.published else {
+            return false;
+        };
+        if !visited.insert(PublishedDependency {
+            key: entry.record.key.clone(),
+            path: path.clone(),
+        }) {
+            return true;
+        }
+        entry.matches_published_file()
+            && entry.record.playlist.as_ref().is_none_or(|playlist| {
+                playlist.dependencies.iter().all(|dependency| {
+                    self.published_at(&dependency.key, &dependency.path)
+                        .is_some_and(|entry| self.valid_published_graph(entry, visited))
+                })
+            })
+    }
+
+    fn publish_playlists(&mut self, root: &Path, capacity: u64) {
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let sources: Vec<_> = self.playlists.keys().cloned().collect();
+            for source in sources {
+                if publish_playlist(root, self, capacity, &source).unwrap_or_else(|error| {
+                    cache_warning("publish_playlist", &format_args!("{error:#}"));
+                    false
+                }) {
+                    if !self
+                        .playlists
+                        .get(&source)
+                        .is_some_and(|(_, playlist)| hls::is_master(playlist))
+                    {
+                        self.playlists.remove(&source);
+                    }
+                    changed = true;
+                }
+            }
+        }
+    }
+
+    fn remember_playlist(&mut self, source: &str, canonical: String) {
+        if self.playlists.len() >= 128
+            && !self.playlists.contains_key(source)
+            && let Some(oldest) = self
+                .playlists
+                .iter()
+                .filter(|(source, _)| !self.pins.contains_key(&key(source)))
+                .min_by_key(|(_, (seen, _))| *seen)
+                .map(|(source, _)| source.clone())
+        {
+            self.playlists.remove(&oldest);
+        }
+        self.playlists
+            .insert(source.to_owned(), (Instant::now(), canonical));
     }
 
     fn insert(&mut self, entry: Entry) {
@@ -558,7 +874,7 @@ impl Index {
         Some(())
     }
 
-    fn evict(&mut self, capacity: u64) {
+    fn reap_retired(&mut self) {
         self.retired.retain(|(entry, size)| {
             if entry.strong_count() > 0 {
                 return true;
@@ -566,43 +882,53 @@ impl Index {
             self.size -= size;
             false
         });
+    }
+
+    fn evict(&mut self, capacity: u64) {
+        self.reap_retired();
         if self.size <= capacity {
             return;
         }
-        let mut candidates: Vec<_> = self
-            .entries
-            .values()
-            .flatten()
-            .filter(|entry| Arc::strong_count(entry) == 1)
-            .map(|entry| {
-                (
-                    *entry.used.lock().unwrap(),
-                    entry.path.clone(),
-                    entry.size(),
-                )
-            })
-            .collect();
-        candidates.sort_unstable();
-        let mut paths = HashSet::new();
-        for (_, path, size) in candidates {
-            if self.size <= capacity {
+        while self.size > capacity {
+            let dependencies: HashSet<_> = self
+                .entries
+                .values()
+                .flatten()
+                .filter_map(|entry| entry.record.playlist.as_ref())
+                .flat_map(|playlist| playlist.dependencies.iter().map(|item| &item.key))
+                .collect();
+            let Some((key, position)) = self
+                .entries
+                .iter()
+                .flat_map(|(key, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .map(move |(position, entry)| (key, position, entry))
+                })
+                .filter(|(key, _, entry)| {
+                    Arc::strong_count(entry) == 1
+                        && !dependencies.contains(key)
+                        && !self.pins.contains_key(*key)
+                })
+                .min_by_key(|(_, _, entry)| *entry.used.lock().unwrap())
+                .map(|(key, position, _)| (key.clone(), position))
+            else {
                 break;
+            };
+            if self.entries[&key][position].record.playlist.is_some() {
+                self.clear_group(&key);
+                self.reap_retired();
+                continue;
             }
-            self.size -= size;
-            paths.insert(path);
+            let entries = self.entries.get_mut(&key).unwrap();
+            let entry = entries.swap_remove(position);
+            if entries.is_empty() {
+                self.entries.remove(&key);
+            }
+            self.size -= entry.size();
+            delete(&entry);
         }
-        tracing::debug!(intervals = paths.len(), "cache intervals evicted");
-        self.entries.retain(|_, entries| {
-            entries.retain(|entry| {
-                if paths.contains(&entry.path) {
-                    delete(entry);
-                    false
-                } else {
-                    true
-                }
-            });
-            !entries.is_empty()
-        });
     }
 }
 
@@ -610,34 +936,72 @@ pub fn key(source: &str) -> String {
     format!("{:x}", Sha256::digest(source.as_bytes()))
 }
 
-fn load(path: &Path) -> Result<Entry> {
-    let record: Record = serde_json::from_reader(File::open(path)?)?;
-    let path = path.with_extension("data");
-    let metadata = fs::metadata(&path)?;
+fn ensure_directory(path: &Path) -> Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure!(
+                fs::symlink_metadata(path)?.is_dir(),
+                "not a cache directory"
+            );
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load(root: &Path, sidecar: &Path) -> Result<Entry> {
+    let record: Record = serde_json::from_reader(File::open(sidecar)?)?;
+    ensure!(key(&record.source) == record.key, "invalid cache key");
+    let path = if let Some(relative) = &record.published {
+        ensure!(relative.components().count() >= 2, "invalid published path");
+        let mut path = root.to_path_buf();
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                anyhow::bail!("invalid published path");
+            };
+            path.push(name);
+            ensure!(
+                !fs::symlink_metadata(&path)?.is_symlink(),
+                "symlink in published path"
+            );
+        }
+        path
+    } else {
+        sidecar.with_extension("part")
+    };
+    let metadata = fs::symlink_metadata(&path)?;
     ensure!(
         record.span.start < record.span.end && record.span.end <= record.metadata.size,
         "invalid span"
     );
     ensure!(
-        metadata.len() == record.span.end - record.span.start,
-        "invalid cache file length"
+        metadata.is_file()
+            && metadata.len() == record.span.end - record.span.start
+            && record
+                .modified
+                .is_none_or(|time| metadata.modified().ok() == Some(time)),
+        "invalid cache file"
     );
+    let used = if record.published.is_some() {
+        fs::metadata(sidecar)?.modified()?
+    } else {
+        metadata.modified()?
+    };
     Ok(Entry {
         record,
         path,
-        used: Mutex::new(metadata.modified()?),
+        sidecar: sidecar.to_path_buf(),
+        used: Mutex::new(used),
         retired: AtomicBool::new(false),
     })
 }
 
-fn owned(path: &Path) -> bool {
-    path.file_stem()
-        .is_some_and(|name| name.to_string_lossy().starts_with("rpc-"))
-}
-
 fn delete(entry: &Entry) {
-    remove(&entry.path.with_extension("json"));
-    remove(&entry.path);
+    remove(&entry.sidecar);
+    if entry.record.published.is_none() || entry.matches_published_file() {
+        remove(&entry.path);
+    }
 }
 
 fn remove(path: &Path) {
@@ -692,7 +1056,7 @@ impl IntervalWriter {
 }
 
 pub(crate) struct WholeWriter {
-    key: String,
+    source: String,
     metadata: Metadata,
     data: StagedInterval,
 }
@@ -726,7 +1090,7 @@ impl WholeWriter {
             && let Some(version) =
                 reservation
                     .cache
-                    .adopt(&self.key, self.metadata, reservation.generation)
+                    .adopt(&self.source, self.metadata, reservation.generation)
         {
             self.data.commit(version).await;
         }

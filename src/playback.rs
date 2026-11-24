@@ -32,10 +32,12 @@ use crate::{
     range::{self, Requested},
 };
 
-type Body = UnsyncBoxBody<Bytes, io::Error>;
+pub(crate) type Body = UnsyncBoxBody<Bytes, io::Error>;
 type Sender = mpsc::Sender<io::Result<Frame<Bytes>>>;
 
 pub struct Playback {
+    pub(crate) downloads: crate::offline::Downloads,
+    recent_variants: Mutex<HashMap<String, String>>,
     pub cache: Arc<Cache>,
     pub origin: Origin,
     pub(crate) signing_key: Option<ring::hmac::Key>,
@@ -123,6 +125,8 @@ impl Playback {
         Self {
             cache,
             origin,
+            downloads: Default::default(),
+            recent_variants: Mutex::default(),
             signing_key: None,
             request_locks: Mutex::default(),
             gaps: Mutex::default(),
@@ -152,7 +156,14 @@ impl Playback {
         Ok(response)
     }
 
-    async fn handle(self: &Arc<Self>, request: Request<Incoming>) -> Result<Response<Body>> {
+    pub(crate) fn recent_variant(&self, source: &str) -> Option<String> {
+        self.recent_variants.lock().unwrap().get(source).cloned()
+    }
+
+    pub(crate) async fn handle(
+        self: &Arc<Self>,
+        request: Request<impl Sized>,
+    ) -> Result<Response<Body>> {
         let Some(source) = request
             .uri()
             .path_and_query()
@@ -160,6 +171,11 @@ impl Playback {
         else {
             return Ok(plain(StatusCode::NOT_FOUND, "unknown playback path"));
         };
+        if self.signing_key.is_none()
+            && let Some(source) = source.strip_prefix("offline/")
+        {
+            return self.download_request(&request, source);
+        }
         let source = if let Some(key) = &self.signing_key {
             let Some(source) = crate::mobile::verify(key, source) else {
                 return Ok(plain(StatusCode::NOT_FOUND, "unknown playback path"));
@@ -183,11 +199,26 @@ impl Playback {
                 .insert(header::ALLOW, HeaderValue::from_static("GET, HEAD"));
             return Ok(response);
         }
+        if !head
+            && resource == Some(Resource::Playlist)
+            && let Some(parent) = self.downloads.note_variant_request(source)
+        {
+            let mut recent = self.recent_variants.lock().unwrap();
+            if recent.len() >= 128 {
+                recent.clear();
+            }
+            recent.insert(parent, source.to_owned());
+        }
+        if matches!(resource, None | Some(Resource::Playlist))
+            && let Some(playlist) = self.cache.published_playlist(source)
+        {
+            return self.playlist_response(&playlist, head);
+        }
         if resource == Some(Resource::Playlist)
             || (resource.is_none() && hls::playlist_path(uri.path()))
         {
             let origin = self.origin.fetch(source, Method::GET, None).await?;
-            return self.playlist(origin, head).await;
+            return self.playlist(source, origin, head).await;
         }
         if resource == Some(Resource::Key) {
             let origin = self
@@ -230,7 +261,7 @@ impl Playback {
                 && hls::playlist_type(origin.headers())
             {
                 let origin = self.origin.fetch(source, Method::GET, None).await?;
-                return self.playlist(origin, true).await;
+                return self.playlist(source, origin, true).await;
             }
             return relay_headers(origin.status(), origin.headers(), empty());
         }
@@ -278,7 +309,7 @@ impl Playback {
                     origin = self.origin.fetch(source, Method::GET, None).await?;
                 }
             }
-            return self.playlist(origin, false).await;
+            return self.playlist(source, origin, false).await;
         }
 
         match origin.status() {
@@ -288,7 +319,7 @@ impl Playback {
                     requested.resolve(metadata.size).as_ref() == Some(&span),
                     "unexpected origin byte range"
                 );
-                let version = self.cache.adopt(&key, metadata.clone(), generation);
+                let version = self.cache.adopt(source, metadata.clone(), generation);
                 let part = Part::RemoteRange {
                     body: origin.into_body(),
                     version,
@@ -303,11 +334,21 @@ impl Playback {
                 let status = origin.status();
                 let headers = origin.headers().clone();
                 let length = content_length(&headers)?;
-                let part = if resource == Some(Resource::Media) {
+                let part = if resource == Some(Resource::Media)
+                    || uri
+                        .path()
+                        .as_bytes()
+                        .last_chunk::<4>()
+                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".mp4"))
+                    || headers
+                        .get(header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok())
+                        .is_some_and(|value| value.starts_with("video/"))
+                {
                     let metadata = origin_metadata(&origin, length.unwrap_or_default())?;
                     let writer = self
                         .cache
-                        .whole_writer(key, metadata, length, generation)
+                        .whole_writer(source.to_owned(), metadata, length, generation)
                         .map(Box::new);
                     Part::RemoteWhole {
                         body: origin.into_body(),
@@ -358,10 +399,24 @@ impl Playback {
         Ok(response)
     }
 
-    async fn playlist(&self, origin: Response<Incoming>, head: bool) -> Result<Response<Body>> {
+    async fn playlist(
+        &self,
+        source: &str,
+        origin: Response<Incoming>,
+        head: bool,
+    ) -> Result<Response<Body>> {
         if !origin.status().is_success() {
             return relay_headers(origin.status(), origin.headers(), empty());
         }
+        let canonical = self.canonical_playlist(origin).await?;
+        self.downloads.note_playlist(source, &canonical);
+        if !head {
+            self.cache.observe_playlist(source, canonical.clone());
+        }
+        self.playlist_response(&canonical, head)
+    }
+
+    pub(crate) async fn canonical_playlist(&self, origin: Response<Incoming>) -> Result<String> {
         identity(origin.headers())?;
         if origin.status() == StatusCode::PARTIAL_CONTENT {
             let (span, metadata) = partial_metadata(&origin)?;
@@ -380,9 +435,16 @@ impl Playback {
                 .0,
         )?;
         let body = collect_limited(origin.into_body(), hls::MAX_PLAYLIST_BYTES).await?;
-        let playlist = hls::rewrite(std::str::from_utf8(&body)?, |resource, reference| {
-            let source = hls::resolve(&base, reference)?;
-            self.origin.validate(&source)?;
+        hls::rewrite(std::str::from_utf8(&body)?, |_, reference| {
+            let address = hls::resolve(&base, reference)?;
+            self.origin.validate(&address)?;
+            Ok(address)
+        })
+    }
+
+    fn playlist_response(&self, canonical: &str, head: bool) -> Result<Response<Body>> {
+        let playlist = hls::rewrite(canonical, |resource, source| {
+            self.origin.validate(source)?;
             let path = format!("hls/{}/{source}", resource.name());
             Ok(match &self.signing_key {
                 Some(key) => format!("/v1/{}", crate::mobile::sign(key, &path)),
@@ -891,7 +953,7 @@ fn empty() -> Body {
     full(Bytes::new())
 }
 
-fn full(bytes: Bytes) -> Body {
+pub(crate) fn full(bytes: Bytes) -> Body {
     Full::new(bytes)
         .map_err(|never| match never {})
         .boxed_unsync()

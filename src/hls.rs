@@ -218,3 +218,254 @@ fn rewrite_attributes(
     }
     Ok(output.join(","))
 }
+
+pub(crate) fn available_playlist(
+    canonical: &str,
+    available: impl Fn(Resource, &str) -> bool,
+) -> Result<Option<String>> {
+    if uses_encryption(canonical) {
+        return Ok(None);
+    }
+
+    if !is_master(canonical) {
+        let mut ready = true;
+        let _ = rewrite(canonical, |resource, source| {
+            ready &= available(resource, source);
+            Ok(source.to_owned())
+        })?;
+        return Ok(ready.then(|| canonical.to_owned()));
+    }
+
+    let mut output = String::from("#EXTM3U\n");
+    let mut variants = Vec::new();
+    let mut renditions = Vec::new();
+    let mut lines = canonical.lines().skip(1);
+    while let Some(line) = lines.next() {
+        if let Some(attributes) = line.strip_prefix("#EXT-X-STREAM-INF:") {
+            let source = lines.next().context("missing HLS variant URI")?;
+            if available(Resource::Playlist, source) {
+                variants.push((attributes, source));
+            }
+        } else if let Some(attributes) = line.strip_prefix("#EXT-X-MEDIA:") {
+            if attribute(attributes, "URI")
+                .is_none_or(|source| available(Resource::Playlist, source))
+            {
+                renditions.push((line, attributes));
+            }
+        } else if !line.starts_with("#EXT-X-I-FRAME-STREAM-INF:") {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    let has_group = |kind, group| {
+        renditions.iter().any(|(_, attributes)| {
+            attribute(attributes, "TYPE") == Some(kind)
+                && attribute(attributes, "GROUP-ID") == Some(group)
+        })
+    };
+    let mut count = 0;
+    let mut groups = std::collections::HashSet::new();
+    let mut streams = String::new();
+    for (attributes, source) in variants {
+        if attribute(attributes, "AUDIO").is_some_and(|group| !has_group("AUDIO", group)) {
+            continue;
+        }
+        count += 1;
+        let mut kept = Vec::new();
+        for item in split_attributes(attributes) {
+            let (name, value) = item
+                .split_once('=')
+                .context("invalid HLS variant attribute")?;
+            if matches!(name, "AUDIO" | "SUBTITLES" | "VIDEO" | "CLOSED-CAPTIONS") {
+                let group = value.trim_matches('"');
+                if has_group(name, group) {
+                    groups.insert((name, group));
+                } else if name != "CLOSED-CAPTIONS" || value != "NONE" {
+                    continue;
+                }
+            }
+            kept.push(item);
+        }
+        streams.push_str("#EXT-X-STREAM-INF:");
+        streams.push_str(&kept.join(","));
+        streams.push('\n');
+        streams.push_str(source);
+        streams.push('\n');
+    }
+    if count == 0 {
+        return Ok(None);
+    }
+    for (line, attributes) in renditions {
+        if let (Some(kind), Some(group)) = (
+            attribute(attributes, "TYPE"),
+            attribute(attributes, "GROUP-ID"),
+        ) && groups.contains(&(kind, group))
+        {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output.push_str(&streams);
+    Ok(Some(output))
+}
+
+pub(crate) fn attribute<'a>(attributes: &'a str, name: &str) -> Option<&'a str> {
+    split_attributes(attributes).find_map(|item| {
+        let (key, value) = item.split_once('=')?;
+        (key.trim() == name).then(|| value.trim().trim_matches('"'))
+    })
+}
+
+fn split_attributes(attributes: &str) -> impl Iterator<Item = &str> {
+    let mut quoted = false;
+    attributes.split(move |character| {
+        if character == '"' {
+            quoted = !quoted;
+        }
+        character == ',' && !quoted
+    })
+}
+
+pub(crate) fn media_references(
+    canonical: &str,
+    mut write: impl FnMut(&str, Option<std::ops::Range<u64>>) -> Result<(String, bool)>,
+) -> Result<String> {
+    let mut output = String::new();
+    let mut pending = None;
+    let mut previous = None;
+    for line in canonical.lines() {
+        if let Some(value) = line.strip_prefix("#EXT-X-BYTERANGE:") {
+            ensure!(
+                pending.replace(value).is_none(),
+                "duplicate segment byte range"
+            );
+            continue;
+        }
+        if let Some(attributes) = line.strip_prefix("#EXT-X-MAP:") {
+            let source = attribute(attributes, "URI").context("missing initialization URI")?;
+            let range = attribute(attributes, "BYTERANGE")
+                .map(|value| byte_range(value, None))
+                .transpose()?;
+            let (uri, sliced) = write(source, range.clone())?;
+            output.push_str("#EXT-X-MAP:");
+            let mut rewritten = Vec::new();
+            for item in split_attributes(attributes) {
+                let (name, _) = item
+                    .split_once('=')
+                    .context("invalid initialization attribute")?;
+                let item = match name.trim() {
+                    "URI" => format!("URI=\"{uri}\""),
+                    "BYTERANGE" if sliced => {
+                        let range = range.as_ref().context("missing initialization range")?;
+                        format!("BYTERANGE=\"{}@0\"", range.end - range.start)
+                    }
+                    _ => item.to_owned(),
+                };
+                rewritten.push(item);
+            }
+            output.push_str(&rewritten.join(","));
+        } else if !line.is_empty() && !line.starts_with('#') {
+            let range = pending
+                .take()
+                .map(|value| {
+                    let start = previous
+                        .filter(|(source, _)| *source == line)
+                        .map(|(_, end)| end);
+                    byte_range(value, start)
+                })
+                .transpose()?;
+            let (uri, sliced) = write(line, range.clone())?;
+            previous = range.as_ref().map(|span| (line, span.end));
+            if let Some(range) = range {
+                let offset = if sliced { 0 } else { range.start };
+                output.push_str(&format!(
+                    "#EXT-X-BYTERANGE:{}@{offset}\n",
+                    range.end - range.start
+                ));
+            }
+            output.push_str(&uri);
+        } else {
+            output.push_str(line);
+        }
+        output.push('\n');
+    }
+    ensure!(pending.is_none(), "missing byte-range segment");
+    Ok(output)
+}
+
+fn byte_range(value: &str, inherited: Option<u64>) -> Result<std::ops::Range<u64>> {
+    let (length, offset) = value
+        .split_once('@')
+        .map_or((value, None), |(len, off)| (len, Some(off)));
+    let length: u64 = length.parse()?;
+    ensure!(length > 0, "empty HLS byte range");
+    let start: u64 = if let Some(offset) = offset {
+        offset.parse()?
+    } else {
+        inherited.context("missing HLS byte range offset")?
+    };
+    Ok(start
+        ..start
+            .checked_add(length)
+            .context("HLS byte range overflow")?)
+}
+
+pub(crate) fn is_master(canonical: &str) -> bool {
+    canonical.lines().any(|line| {
+        line.starts_with("#EXT-X-STREAM-INF:")
+            || line.starts_with("#EXT-X-MEDIA:")
+            || line.starts_with("#EXT-X-I-FRAME-STREAM-INF:")
+    })
+}
+
+pub(crate) fn uses_encryption(canonical: &str) -> bool {
+    canonical.lines().any(|line| {
+        line.starts_with("#EXT-X-SESSION-KEY:")
+            || line.starts_with("#EXT-X-KEY:") && line != "#EXT-X-KEY:METHOD=NONE"
+    })
+}
+
+pub(crate) struct Variant<'a> {
+    pub(crate) source: &'a str,
+    pub(crate) attributes: &'a str,
+    pub(crate) bandwidth: u64,
+}
+
+pub(crate) fn variants(canonical: &str) -> Vec<Variant<'_>> {
+    let mut variants = Vec::new();
+    let mut lines = canonical.lines();
+    while let Some(line) = lines.next() {
+        if let Some(attributes) = line.strip_prefix("#EXT-X-STREAM-INF:")
+            && let Some(source) = lines.next()
+            && let Some(bandwidth) =
+                attribute(attributes, "BANDWIDTH").and_then(|value| value.parse().ok())
+        {
+            variants.push(Variant {
+                source,
+                attributes,
+                bandwidth,
+            });
+        }
+    }
+    variants
+}
+
+pub(crate) fn default_audio<'a>(canonical: &'a str, variant: &str) -> Option<&'a str> {
+    let group = attribute(variant, "AUDIO")?;
+    canonical
+        .lines()
+        .filter_map(|line| line.strip_prefix("#EXT-X-MEDIA:"))
+        .filter(|attributes| {
+            attribute(attributes, "TYPE") == Some("AUDIO")
+                && attribute(attributes, "GROUP-ID") == Some(group)
+        })
+        .map(|attributes| {
+            (
+                attribute(attributes, "DEFAULT") == Some("YES"),
+                attribute(attributes, "URI"),
+            )
+        })
+        .max_by_key(|(default, _)| *default)
+        .and_then(|(_, source)| source)
+}

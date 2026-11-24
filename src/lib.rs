@@ -1,5 +1,6 @@
 pub mod cache;
 mod hls;
+mod offline;
 pub mod origin;
 pub mod playback;
 mod range;

@@ -4,6 +4,7 @@ import concurrent.futures
 import contextlib
 import http.client
 import http.server
+import json
 import os
 from pathlib import Path
 import re
@@ -165,6 +166,119 @@ class PlaybackTests(unittest.TestCase):
         with self.origin.transfer_lock:
             return self.origin.transfers.copy()
 
+    def test_mp4_published_at_source_path_only_after_both_ranges(self):
+        self.start()
+        path = "/movies/demo.mp4?token=secret"
+        published = self.cache / "127.0.0.1" / "movies" / "demo.mp4"
+        status, _, body = self.get("0-99", path=path)
+        self.assertEqual((status, body), (206, self.origin.data[:100]))
+        self.assertFalse(published.exists())
+
+        status, _, body = self.get("100-199", path=path)
+        self.assertEqual((status, body), (206, self.origin.data[100:]))
+        deadline = time.monotonic() + 3
+        while not published.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(published.is_file())
+        self.assertEqual(published.read_bytes(), self.origin.data)
+
+    def test_mp4_query_collision_preserves_both_files_and_evicts_whole_video(self):
+        self.start(capacity=400)
+        first = "/films/movie.mp4?token=first"
+        second = "/films/movie.mp4?token=second"
+        self.origin.resources[second] = ("video/mp4", b"B" * 200)
+        directory = self.cache / "127.0.0.1" / "films"
+        self.assertEqual(self.get(path=first)[2], self.origin.data)
+        self.assertEqual(self.get(path=second)[2], b"B" * 200)
+        original = directory / "movie.mp4"
+        alternate, = directory.glob("movie~*.mp4")
+        self.assertEqual(original.read_bytes(), self.origin.data)
+        self.assertEqual(alternate.read_bytes(), b"B" * 200)
+        self.stop()
+        self.start(capacity=400)
+        self.origin.expired = True
+        self.assertEqual(self.get("10-19", path=second)[2], b"B" * 10)
+        self.origin.expired = False
+        self.assertEqual(self.get(path="/films/third.mp4")[2], self.origin.data)
+        self.assertFalse(original.exists())
+        self.assertEqual(alternate.read_bytes(), b"B" * 200)
+
+    def test_offline_task_publishes_mp4_and_reports_completion(self):
+        self.start()
+        path = "/v1/offline/" + self.source + "/download/movie.mp4"
+        status, _, body = self.get(method="POST", proxy_path=path)
+        self.assertEqual(status, 202)
+        self.assertEqual(json.loads(body)["state"], "running")
+        deadline = time.monotonic() + 5
+        while True:
+            status, _, body = self.get(proxy_path=path)
+            self.assertEqual(status, 200)
+            task = json.loads(body)
+            if task["state"] != "running" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        self.assertEqual(task["state"], "completed")
+        self.assertEqual(task["processed_bytes"], len(self.origin.data))
+        published = self.cache / "127.0.0.1" / "download" / "movie.mp4"
+        self.assertEqual(published.read_bytes(), self.origin.data)
+
+    def test_offline_task_adds_requested_hls_variant_to_existing_master(self):
+        self.start(capacity=8192)
+        self.origin.resources["/master.m3u8"] = ("application/vnd.apple.mpegurl", b"""#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=100
+low.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=500
+high.m3u8
+""")
+        for variant in ("low", "high"):
+            self.origin.resources[f"/{variant}.m3u8"] = (
+                "application/vnd.apple.mpegurl",
+                f"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\n{variant}.ts\n#EXT-X-ENDLIST\n".encode(),
+            )
+            self.origin.resources[f"/{variant}.ts"] = ("video/mp2t", variant.encode())
+        path = "/v1/offline/" + self.source + "/master.m3u8"
+        published = self.cache / "127.0.0.1" / "master.m3u8"
+        for bandwidth, expected in [(None, ["low.m3u8"]), (500, ["low.m3u8", "high.m3u8"])]:
+            with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)) as conn:
+                headers = {"X-RPC-Bandwidth": str(bandwidth)} if bandwidth else {}
+                conn.request("POST", path, headers=headers)
+                response = conn.getresponse()
+                self.assertEqual(response.status, 202)
+                response.read()
+            deadline = time.monotonic() + 5
+            while True:
+                _, _, body = self.get(proxy_path=path)
+                progress = json.loads(body)
+                if progress["state"] != "running" or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(progress["state"], "completed")
+            self.assertEqual([line for line in published.read_text().splitlines()
+                              if line and not line.startswith("#")], expected)
+
+    def test_offline_cancel_preserves_previously_cached_range(self):
+        self.start()
+        source = "/cancel/movie.mp4"
+        path = "/v1/offline/" + self.source + source
+        self.assertEqual(self.get("0-99", path=source)[2], self.origin.data[:100])
+        self.origin.block_range = "bytes=100-199"
+        try:
+            self.assertEqual(self.get(method="POST", proxy_path=path)[0], 202)
+            deadline = time.monotonic() + 5
+            while not any(request[2] == "bytes=100-199" for request in self.origin.requests):
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+            self.assertEqual(self.get(method="POST", proxy_path=path)[0], 202)
+            self.assertEqual(self.get(method="DELETE", proxy_path=path)[0], 200)
+            while json.loads(self.get(proxy_path=path)[2])["state"] != "cancelled":
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.01)
+        finally:
+            self.origin.release_range.set()
+        self.origin.expired = True
+        self.assertEqual(self.get("0-99", path=source)[2], self.origin.data[:100])
+        self.assertFalse((self.cache / "127.0.0.1" / "cancel" / "movie.mp4").exists())
+
     def test_hls_rewrites_redirected_playlist_using_final_url(self):
         self.start()
         self.origin.redirects["/stream"] = "/media/entry"
@@ -178,6 +292,32 @@ class PlaybackTests(unittest.TestCase):
         segment = body.decode().splitlines()[3]
         self.assertTrue(segment.startswith("/"))
         self.assertEqual(self.get(proxy_path=segment)[2], b"segment")
+
+    def test_hls_publishes_local_playlist_and_plays_after_restart(self):
+        self.start()
+        self.origin.resources["/show/index.m3u8"] = (
+            "application/vnd.apple.mpegurl",
+            b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nclip.ts\n#EXT-X-ENDLIST\n",
+        )
+        self.origin.resources["/show/clip.ts"] = ("video/mp2t", b"segment")
+        published = self.cache / "127.0.0.1" / "show" / "index.m3u8"
+        _, _, playlist = self.get(path="/show/index.m3u8")
+        self.assertFalse(published.exists())
+        self.assertEqual(self.get(proxy_path=playlist.decode().splitlines()[3])[2], b"segment")
+        deadline = time.monotonic() + 3
+        while not published.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(published.is_file())
+        self.assertEqual((published.parent / "clip.ts").read_bytes(), b"segment")
+        self.assertIn("\nclip.ts\n", published.read_text())
+        self.stop()
+        self.origin.expired = True
+        self.origin.requests.clear()
+        self.start()
+        status, _, playlist = self.get(path="/show/index.m3u8")
+        self.assertEqual(status, 200)
+        self.assertEqual(self.get(proxy_path=playlist.decode().splitlines()[3])[2], b"segment")
+        self.assertEqual(self.origin.requests, [])
 
     def test_hls_master_routes_variants_audio_and_subtitles_through_proxy(self):
         self.start()
@@ -203,6 +343,53 @@ high
             status, _, playlist = self.get(proxy_path=url)
             self.assertEqual(status, 200)
             self.assertIn(f"/{rendition}.bin".encode(), playlist)
+
+    def test_hls_publishes_only_referenced_bytes_of_incomplete_resource(self):
+        self.start()
+        self.origin.resources["/show/range.m3u8"] = ("application/vnd.apple.mpegurl", b"""#EXTM3U
+#EXT-X-VERSION:4
+#EXT-X-TARGETDURATION:4
+#EXTINF:4,
+#EXT-X-BYTERANGE:4@2
+shared.ts
+#EXT-X-ENDLIST
+""")
+        self.origin.resources["/show/shared.ts"] = ("video/mp2t", b"12abcd78")
+        _, _, playlist = self.get(path="/show/range.m3u8")
+        self.assertEqual(self.get("2-5", proxy_path=playlist.decode().splitlines()[-2])[2], b"abcd")
+        published = self.cache / "127.0.0.1" / "show" / "range.m3u8"
+        deadline = time.monotonic() + 3
+        while not published.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(published.is_file())
+        self.assertFalse((published.parent / "shared.ts").exists())
+        segment = published.read_text().splitlines()[-2]
+        self.assertEqual((published.parent / segment).read_bytes(), b"abcd")
+        self.origin.expired = True
+        _, _, offline = self.get(path="/show/range.m3u8")
+        self.assertEqual(self.get("2-5", proxy_path=offline.decode().splitlines()[-2])[2], b"abcd")
+
+    def test_clear_hls_releases_exclusive_segments_and_preserves_shared_segments(self):
+        self.start(capacity=4096)
+        directory = self.cache / "127.0.0.1"
+        for name in ("one", "two"):
+            self.origin.resources[f"/{name}.m3u8"] = (
+                "application/vnd.apple.mpegurl",
+                f"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4,\nshared.ts\n"
+                f"#EXTINF:4,\n{name}.ts\n#EXT-X-ENDLIST\n".encode(),
+            )
+            _, _, playlist = self.get(path=f"/{name}.m3u8")
+            for line in playlist.decode().splitlines():
+                if line.startswith("/"):
+                    self.assertEqual(self.get(proxy_path=line)[0], 200)
+            self.assertTrue((directory / f"{name}.m3u8").is_file())
+        self.stop()
+        subprocess.run([BINARY, "clear", self.source + "/one.m3u8"], check=True,
+                       env={**os.environ, "RPC_CACHE_DIR": str(self.cache)})
+        self.assertFalse((directory / "one.m3u8").exists())
+        self.assertFalse((directory / "one.ts").exists())
+        self.assertTrue((directory / "two.m3u8").is_file())
+        self.assertTrue((directory / "shared.ts").is_file())
 
     def test_hls_fmp4_ranges_and_aes_key_use_their_own_cache_policies(self):
         self.start()
@@ -326,6 +513,25 @@ unsized.ts
                 self.assertEqual(len(re.findall(rb"(?m)^0,", decoded.stdout)), 4)
                 self.assertTrue(any(item[1].startswith(f"/{segment_type}/movie4")
                                     for item in self.origin.requests))
+                offline = f"/v1/offline/{self.source}/{segment_type}/movie.m3u8"
+                self.assertEqual(self.get(method="POST", proxy_path=offline)[0], 202)
+                deadline = time.monotonic() + 5
+                while True:
+                    progress = json.loads(self.get(proxy_path=offline)[2])
+                    if progress["state"] != "running" or time.monotonic() >= deadline:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(progress["state"], "completed")
+                published = self.cache / "127.0.0.1" / segment_type / "movie.m3u8"
+                self.origin.expired = True
+                try:
+                    local = subprocess.run([
+                        "ffmpeg", "-v", "error", "-ss", "4", "-i", str(published),
+                        "-frames:v", "4", "-f", "framehash", "-",
+                    ], check=True, timeout=20, capture_output=True)
+                finally:
+                    self.origin.expired = False
+                self.assertEqual(local.stdout, decoded.stdout)
 
     def test_ranges_hits_restart_expiry_and_clear(self):
         self.start()
@@ -354,7 +560,7 @@ unsized.ts
         self.start(log_level="debug")
         self.get("40-59")
         self.get("60-79")
-        next(path for path in self.cache.glob("*.data")
+        next(path for path in (self.cache / ".rpc").glob("*.part")
              if path.read_bytes() == self.origin.data[40:60]).unlink()
         self.assertEqual(self.get("40-79")[2], self.origin.data[40:80])
         self.assertEqual(self.get("40-79")[2], self.origin.data[40:80])
@@ -399,7 +605,7 @@ unsized.ts
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
             self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
-            self.assertEqual(list(self.cache.glob("*.data")), [])
+            self.assertEqual(list((self.cache / ".rpc").glob("*.part")), [])
         self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
         self.assertEqual(self.get("0-9")[2], self.origin.data[:10])
         self.assertEqual(len(self.origin.requests), 4)
@@ -420,7 +626,7 @@ unsized.ts
                     inflight = executor.submit(self.get, "0-29", SIGNED_PATH, "GET", headers_received)
                     try:
                         self.assertTrue(headers_received.wait(5))
-                        next(path for path in self.cache.glob("*.data")
+                        next(path for path in (self.cache / ".rpc").glob("*.part")
                              if path.read_bytes() == self.origin.data[20:30]).unlink()
                         if not expected_same_version:
                             self.origin.etag = '"replacement"'

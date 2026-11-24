@@ -31,8 +31,9 @@ RPC_ORIGIN_HOSTS=media.example.com,cdn.example.com cargo run --release --locked
 
 - 支持无 Range 的渐进式 `GET`、单字节区间 `GET` 和 `HEAD`。源站忽略播放器的 Range 请求时返回 `502`。
 - 完整命中的媒体数据直接从磁盘读取。更换签名会使用独立的缓存条目。
-- HLS 播放列表和标准 AES-128 密钥按请求回源。MPEG-TS、fMP4 初始化数据和媒体分片与单文件视频共享缓存容量和 LRU。播放器可按主播放列表选择码率、音轨和字幕。
-- 缓存无 TTL，跨重启保留，容量不足时按全局 LRU 淘汰区间。补齐缺口时，只有源站目标和强 `ETag` 一致才合并字节。
+- 单文件视频收齐后按源地址的 `host/path` 发布，文件可直接打开。相同路径发生冲突时保留扩展名并加短后缀。尚未发布的数据和索引保存在缓存根目录的 `.rpc` 子目录中。
+- 明文 HLS 点播在收齐一个可播放版本后发布本地 `m3u8`，用相对路径引用分片和其他依赖。原代理地址也可离线播放已发布版本。尚未发布的播放列表和 AES-128 密钥按请求回源。
+- 缓存无 TTL，跨重启保留。待发布数据和已发布文件共用容量和全局 LRU。已发布 MP4 按整文件淘汰，已发布 HLS 按可播放条目淘汰。补齐缺口时，只有源站目标和强 `ETag` 一致才合并字节。
 - 同一视频版本、同一缺失区间的并发请求共享回源，下载成功后从缓存读取该区间。缓存容量不足或写入失败时，等待的请求可能再次回源。
 
 运行时发现缓存文件缺失，会移除失效索引并回源补齐。整个缓存目录丢失后，服务尝试重建并重新取得独占锁。磁盘或锁暂不可用时，请求仍可回源，后续请求会再次尝试恢复缓存。响应已经开始时，只在能确认目标与强 `ETag` 一致的情况下补齐缺失区间。
@@ -42,6 +43,8 @@ RPC_ORIGIN_HOSTS=media.example.com,cdn.example.com cargo run --release --locked
 ```sh
 RPC_CACHE_DIR=./cache target/release/rs-proxy-cache clear 'https://media.example.com/video.mp4?token=a%2Fb&expires=123'
 ```
+
+显式离线缓存使用 `POST /v1/offline/{完整源地址}`，并在同一路径用 `GET` 查询进度或用 `DELETE` 请求取消。HLS 可通过 `X-RPC-Bandwidth` 指定主播放列表中的带宽。接口状态与移动端 SDK 共用同一下载任务语义。 [离线缓存接口](sdk/README.md#离线缓存)
 
 ## 日志
 

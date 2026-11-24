@@ -143,6 +143,49 @@ mod ffi {
     }
 
     #[unsafe(no_mangle)]
+    unsafe extern "C" fn rpc_download_start(source: *const c_char, bandwidth: u64) -> *mut c_char {
+        let result = (|| -> Result<String> {
+            let source = unsafe { input(source)? };
+            let instance = INSTANCE.lock().unwrap();
+            let instance = instance.as_ref().context("proxy is closed")?;
+            ensure!(!instance.server.is_finished(), "proxy stopped unexpectedly");
+            let _context = instance._runtime.enter();
+            let (status, progress) = instance
+                .playback
+                .start_download(source, (bandwidth != 0).then_some(bandwidth))?;
+            let mut response = serde_json::to_value(progress)?;
+            response["conflict"] = (status == http::StatusCode::CONFLICT).into();
+            Ok(response.to_string())
+        })();
+        result.map(output).unwrap_or(ptr::null_mut())
+    }
+
+    fn download_progress(source: &str, cancel: bool) -> Option<String> {
+        let instance = INSTANCE.lock().unwrap();
+        let instance = instance.as_ref()?;
+        let progress = instance.playback.download_progress(source, cancel)?;
+        serde_json::to_string(&progress).ok()
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn rpc_download_progress(source: *const c_char) -> *mut c_char {
+        unsafe { input(source) }
+            .ok()
+            .and_then(|source| download_progress(source, false))
+            .map(output)
+            .unwrap_or(ptr::null_mut())
+    }
+
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn rpc_download_cancel(source: *const c_char) -> *mut c_char {
+        unsafe { input(source) }
+            .ok()
+            .and_then(|source| download_progress(source, true))
+            .map(output)
+            .unwrap_or(ptr::null_mut())
+    }
+
+    #[unsafe(no_mangle)]
     extern "C" fn rpc_close() {
         close();
     }

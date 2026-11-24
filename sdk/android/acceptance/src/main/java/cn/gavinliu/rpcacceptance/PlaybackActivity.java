@@ -25,6 +25,7 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.Collections;
+import org.json.JSONObject;
 
 public final class PlaybackActivity extends Activity {
     private static final String TAG = "RpcAcceptance";
@@ -36,26 +37,91 @@ public final class PlaybackActivity extends Activity {
     @Override
     public void onCreate(Bundle state) {
         super.onCreate(state);
-        if (getIntent().getBooleanExtra("verifyTracks", false)) {
-            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        }
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         PlayerView view = new PlayerView(this);
         setContentView(view);
         String source = getIntent().getStringExtra("source");
         if (source == null) throw new IllegalArgumentException("Provide the source intent extra");
         new Thread(() -> {
             try {
-                ProxyCache.start(new File(getCacheDir(), "video"), 64L * 1024 * 1024,
+                String cacheRun = getIntent().getStringExtra("cacheRun");
+                if (cacheRun != null && !cacheRun.matches("[A-Za-z0-9_-]+")) {
+                    throw new IllegalArgumentException("Invalid cache run name");
+                }
+                File cache = new File(getCacheDir(), cacheRun == null ? "video" : "video-" + cacheRun);
+                ProxyCache.start(cache, 64L * 1024 * 1024,
                         Collections.singletonList(Uri.parse(source).getHost()));
                 String url = ProxyCache.playbackUrl(source);
+                if (getIntent().getBooleanExtra("downloadCycle", false)) {
+                    downloadCycle(source, cache, getIntent().getLongExtra("cancelAfterBytes", 1_200_000));
+                    return;
+                }
                 if (getIntent().getBooleanExtra("warm", false)) warmCache(url);
                 runOnUiThread(() -> {
                     if (!isDestroyed()) play(view, url);
                 });
             } catch (Exception error) {
-                Log.e(TAG, "Proxy startup failed", error);
+                Log.e(TAG, "Acceptance failed", error);
             }
         }).start();
+    }
+
+    private void downloadCycle(String source, File cache, long cancelAfter) throws Exception {
+        long initialBytes = cacheFileBytes(cache);
+        Log.i(TAG, "Offline task started " + ProxyCache.startDownload(source, 0));
+        long deadline = android.os.SystemClock.elapsedRealtime() + 180_000;
+        while (true) {
+            JSONObject progress = readProgress(source, deadline);
+            if (!"running".equals(progress.getString("state"))) {
+                throw new IllegalStateException("Download ended before cancellation " + progress);
+            }
+            if (progress.getLong("processed_bytes") >= cancelAfter) {
+                ProxyCache.cancelDownload(source);
+                break;
+            }
+            Thread.sleep(10);
+        }
+        JSONObject cancelled = awaitDownloadEnd(source, deadline);
+        if (!"cancelled".equals(cancelled.getString("state"))) {
+            throw new IllegalStateException("Expected cancellation " + cancelled);
+        }
+        long retained = cacheFileBytes(cache) - initialBytes;
+        if (retained <= 0) throw new IllegalStateException("Cancellation retained no new media");
+        Log.i(TAG, "Offline task cancelled " + cancelled + ", retained media bytes " + retained);
+        Log.i(TAG, "Offline task restarted " + ProxyCache.startDownload(source, 0));
+        JSONObject completed = awaitDownloadEnd(source, android.os.SystemClock.elapsedRealtime() + 180_000);
+        if (!"completed".equals(completed.getString("state"))) {
+            throw new IllegalStateException("Expected completion " + completed);
+        }
+        Log.i(TAG, "Offline task completed " + completed);
+    }
+
+    private static JSONObject readProgress(String source, long deadline) throws Exception {
+        if (android.os.SystemClock.elapsedRealtime() >= deadline) {
+            throw new IllegalStateException("Offline download timed out");
+        }
+        return new JSONObject(ProxyCache.downloadProgress(source));
+    }
+
+    private static JSONObject awaitDownloadEnd(String source, long deadline) throws Exception {
+        while (true) {
+            JSONObject progress = readProgress(source, deadline);
+            if (!"running".equals(progress.getString("state"))) return progress;
+            Thread.sleep(50);
+        }
+    }
+
+    private static long cacheFileBytes(File file) {
+        if (file.isFile()) {
+            String name = file.getName();
+            return name.endsWith(".json") || name.startsWith(".") ? 0 : file.length();
+        }
+        File[] children = file.listFiles();
+        long total = 0;
+        if (children != null) {
+            for (File child : children) total += cacheFileBytes(child);
+        }
+        return total;
     }
 
     private void warmCache(String url) throws Exception {
@@ -131,7 +197,7 @@ public final class PlaybackActivity extends Activity {
     private void verifySeek(long target, int attemptsLeft) {
         if (player == null) return;
         long position = player.getCurrentPosition();
-        if (player.isPlaying() && position >= target && position < target + 5000) {
+        if (player.isPlaying() && position >= target + 250 && position < target + 5000) {
             Log.i(TAG, "Playing after seek at " + position + " (target " + target + ")");
             if (getIntent().getBooleanExtra("verifyTracks", false)) switchTracks();
         } else if (attemptsLeft > 0) {
