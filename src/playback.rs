@@ -795,12 +795,12 @@ async fn send_remote(
 ) -> Result<()> {
     let mut received = 0_u64;
     let mut last = None;
-    loop {
+    let disconnected = loop {
         let frame = tokio::select! {
-            _ = sender.closed() => return Ok(()),
+            _ = sender.closed() => break true,
             frame = timeout(TIMEOUT, body.frame()) => frame?,
         };
-        let Some(frame) = frame else { break };
+        let Some(frame) = frame else { break false };
         let Ok(data) = frame?.into_data() else {
             continue;
         };
@@ -826,9 +826,15 @@ async fn send_remote(
         // Hold the final bytes until length is verified and the completed interval is published.
         if length == Some(received) {
             last = Some(data);
-        } else {
-            sender.send(Ok(Frame::data(data))).await?;
+        } else if sender.send(Ok(Frame::data(data))).await.is_err() {
+            break true;
         }
+    };
+    if disconnected {
+        if let Some(BodyWriter::Interval(writer)) = writer {
+            writer.finish_interrupted().await;
+        }
+        return Ok(());
     }
     ensure!(
         length.is_none_or(|length| received == length),

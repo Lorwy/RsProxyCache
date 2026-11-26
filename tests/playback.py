@@ -205,6 +205,27 @@ class PlaybackTests(unittest.TestCase):
         self.assertTrue(published.is_file())
         self.assertEqual(published.read_bytes(), self.origin.data)
 
+    def test_mp4_publishes_after_player_closes_first_range_early(self):
+        self.start()
+        path = "/movies/seek.mp4"
+        published = self.cache / "127.0.0.1" / "movies" / "seek.mp4"
+        self.origin.pause_body_range = "bytes=0-199"
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)) as conn:
+            conn.request("GET", "/v1/" + self.source + path, headers={"Range": "bytes=0-199"})
+            with conn.getresponse() as response:
+                self.assertEqual(response.status, 206)
+                self.assertEqual(response.read(100), self.origin.data[:100])
+        try:
+            deadline = time.monotonic() + 2
+            while list((self.cache / ".rpc").glob(".rpc-stage-*")) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(published.exists())
+            self.assertEqual(self.get("100-199", path=path)[2], self.origin.data[100:])
+            self.assertTrue(published.is_file())
+            self.assertEqual(published.read_bytes(), self.origin.data)
+        finally:
+            self.origin.release_range.set()
+
     def test_mp4_query_collision_preserves_both_files_and_evicts_whole_video(self):
         self.start(capacity=400)
         first = "/films/movie.mp4?token=first"

@@ -1197,6 +1197,16 @@ impl IntervalWriter {
             chunk.commit(self.version).await;
         }
     }
+
+    pub(crate) async fn finish_interrupted(self) {
+        if let Some(mut chunk) = self.chunk
+            && chunk.span.start < self.next
+            && self.next < self.end
+        {
+            chunk.span.end = self.next;
+            chunk.commit(self.version).await;
+        }
+    }
 }
 
 pub(crate) struct WholeWriter {
