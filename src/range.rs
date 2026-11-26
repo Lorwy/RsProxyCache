@@ -74,3 +74,62 @@ fn number(value: &str) -> Option<u64> {
         .then(|| value.parse().ok())
         .flatten()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_ranges_resolve_to_half_open_spans() {
+        for (header, size, expected) in [
+            ("bytes=0-0", 10, Some(0..1)),
+            ("BYTES=6-", 10, Some(6..10)),
+            ("bytes=8-99", 10, Some(8..10)),
+            ("bytes=-3", 10, Some(7..10)),
+            ("bytes=-30", 10, Some(0..10)),
+            ("bytes=-0", 10, None),
+            ("bytes=10-", 10, None),
+            ("bytes=-1", 0, None),
+            ("bytes=0-18446744073709551615", u64::MAX, Some(0..u64::MAX)),
+        ] {
+            assert_eq!(
+                Requested::parse(header).unwrap().resolve(size),
+                expected,
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_or_multiple_request_ranges() {
+        for header in [
+            "items=0-1",
+            "bytes=-",
+            "bytes=5-4",
+            "bytes=0-1,3-4",
+            "bytes=+1-2",
+            "bytes= 1-2",
+            "bytes=18446744073709551616-",
+        ] {
+            assert!(Requested::parse(header).is_none(), "{header}");
+        }
+    }
+
+    #[test]
+    fn content_range_requires_a_known_size_greater_than_its_last_byte() {
+        assert_eq!(content_range("bytes 4-7/8"), Some((4..8, 8)));
+        assert_eq!(
+            content_range("bytes 0-18446744073709551614/18446744073709551615"),
+            Some((0..u64::MAX, u64::MAX))
+        );
+        for header in [
+            "bytes 0-8/8",
+            "bytes 2-1/8",
+            "bytes 0-1/*",
+            "bytes */8",
+            "bytes 0-18446744073709551615/18446744073709551615",
+        ] {
+            assert!(content_range(header).is_none(), "{header}");
+        }
+    }
+}

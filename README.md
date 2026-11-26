@@ -36,6 +36,8 @@ RPC_ORIGIN_HOSTS=media.example.com,cdn.example.com cargo run --release --locked
 - 缓存无 TTL，跨重启保留。待发布数据和已发布文件共用容量和全局 LRU。已发布 MP4 按整文件淘汰，已发布 HLS 按可播放条目淘汰。补齐缺口时，只有源站目标和强 `ETag` 一致才合并字节。
 - 同一视频版本、同一缺失区间的并发请求共享回源，下载成功后从缓存读取该区间。缓存容量不足或写入失败时，等待的请求可能再次回源。
 
+完整暂存文件可以直接发布。需要拼接缓存区间时，原区间和发布临时文件一起计入容量。配额不足时，已有效缓存的区间仍可用于代理播放。若进程在发布时被强停，重启会根据发布记录检查媒体文件和 HLS 依赖，清理未完成的暂存文件及已被完整文件覆盖的区间。
+
 运行时发现缓存文件缺失，会移除失效索引并回源补齐。整个缓存目录丢失后，服务尝试重建并重新取得独占锁。磁盘或锁暂不可用时，请求仍可回源，后续请求会再次尝试恢复缓存。响应已经开始时，只在能确认目标与强 `ETag` 一致的情况下补齐缺失区间。
 
 同一源地址换片后，如需立即清理旧版本，停止服务后在同一个缓存目录运行：
@@ -52,12 +54,16 @@ RPC_CACHE_DIR=./cache target/release/rs-proxy-cache clear 'https://media.example
 
 ## 验证
 
+开发机安装 Rust、Cargo 和 Python 3.11 或更新版本后，可运行：
+
 ```sh
-cargo build --locked
-python3 tests/playback.py -v
+sh tests/verify.sh          # Rust 单测和本机 HTTP 集成测试
+sh tests/verify.sh --full   # 另跑真实媒体解码和跳转，需要 PATH 上的 FFmpeg
 ```
 
-测试使用本机回环接口和临时缓存目录。系统安装了 FFmpeg 时，还会生成真实 MP4、MPEG-TS HLS 和 fMP4 HLS，经代理验证解码与跳转。实际播放器的接入验收见 [首版播放验收](docs/playback-acceptance.md)。
+测试启动真实代理与受控源站，使用本机回环接口和临时缓存目录。Cargo 依赖已缓存时，可加 `CARGO_NET_OFFLINE=true` 完全离线运行。独占锁竞争用例使用 POSIX `flock`，在其他平台跳过。
+
+完整模式生成 MP4、MPEG-TS HLS 和 fMP4 HLS，经代理验证解码与跳转，并等待一次真实的源站响应体读超时。实际播放器的接入验收见 [首版播放验收](docs/playback-acceptance.md)。
 
 ## 移动端 SDK
 

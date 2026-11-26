@@ -469,3 +469,68 @@ pub(crate) fn default_audio<'a>(canonical: &'a str, variant: &str) -> Option<&'a
         .max_by_key(|(default, _)| *default)
         .and_then(|(_, source)| source)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attributes_preserve_commas_and_equals_inside_quotes() {
+        let attributes = r#"NAME="English, stereo", URI="audio.m3u8?token=a=b,c",DEFAULT=YES"#;
+        assert_eq!(attribute(attributes, "NAME"), Some("English, stereo"));
+        assert_eq!(attribute(attributes, "URI"), Some("audio.m3u8?token=a=b,c"));
+        assert_eq!(attribute(attributes, "DEFAULT"), Some("YES"));
+        assert_eq!(attribute(attributes, "TYPE"), None);
+    }
+
+    #[test]
+    fn sliced_ranges_keep_original_input_offsets_and_use_local_zero_offsets() {
+        let input = concat!(
+            "#EXTM3U\n",
+            "#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"6@2\"\n",
+            "#EXT-X-BYTERANGE:4@10\nmedia.mp4\n",
+            "#EXT-X-BYTERANGE:3\nmedia.mp4\n",
+            "#EXT-X-ENDLIST\n",
+        );
+        let mut references = Vec::new();
+        let output = media_references(input, |source, span| {
+            references.push((source.to_owned(), span));
+            Ok((format!("local-{}.mp4", references.len()), true))
+        })
+        .unwrap();
+        assert_eq!(
+            references,
+            [
+                ("init.mp4".into(), Some(2..8)),
+                ("media.mp4".into(), Some(10..14)),
+                ("media.mp4".into(), Some(14..17)),
+            ]
+        );
+        assert_eq!(
+            output,
+            concat!(
+                "#EXTM3U\n",
+                "#EXT-X-MAP:URI=\"local-1.mp4\",BYTERANGE=\"6@0\"\n",
+                "#EXT-X-BYTERANGE:4@0\nlocal-2.mp4\n",
+                "#EXT-X-BYTERANGE:3@0\nlocal-3.mp4\n",
+                "#EXT-X-ENDLIST\n",
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_ambiguous_byte_ranges() {
+        for input in [
+            "#EXT-X-BYTERANGE:0@0\na.mp4\n",
+            "#EXT-X-BYTERANGE:1@18446744073709551615\na.mp4\n",
+            "#EXT-X-BYTERANGE:1@0\na.mp4\n#EXT-X-BYTERANGE:1\nb.mp4\n",
+            "#EXT-X-BYTERANGE:1@0\n#EXT-X-ENDLIST\n",
+            "#EXT-X-MAP:URI=\"init.mp4\",BYTERANGE=\"4\"\n",
+        ] {
+            assert!(
+                media_references(input, |source, _| Ok((source.into(), false))).is_err(),
+                "{input}"
+            );
+        }
+    }
+}

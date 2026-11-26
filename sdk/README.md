@@ -86,4 +86,8 @@ if let error = rpc_start(directory.path, 64 * 1024 * 1024, "media.example.com") 
 
 状态 JSON 包含 `state`、`processed_bytes` 和 `bandwidth`。处理字节数包括本地复用的数据。`state` 可为 `running`、`completed`、`cancelled`、`unsupported`、`insufficient_capacity` 或 `failed`。取消是异步的，可以继续查询直到任务结束。查询不存在的任务时，HTTP 返回 404，SDK 返回空值。iOS 调用方用 `rpc_free_string` 释放返回的 JSON 字符串。
 
+只有缓存配额无法满足时才返回 `insufficient_capacity`。失败时可检查 `error_code`。磁盘写满为 `disk_full`，缓存写入或发布失败分别为 `cache_write_failed` 和 `publish_failed`。回源响应错误、超时和读取响应体失败分别为 `origin_response`、`origin_timeout` 和 `origin_body_failed`。若 DNS 解析结果全部被回源地址规则拒绝，则为 `origin_address_denied`。其他失败为 `download_failed`。
+
+默认同时运行两个离线任务，另有 16 个等待名额。排队期间状态仍为 `running`，`queued` 为 `true`，可以取消。队列满时，HTTP 返回 429，SDK 返回 `state: "failed"` 和 `error_code: "queue_full"`，释放名额后可重试。独立服务可用 `RPC_DOWNLOAD_PARALLELISM` 和 `RPC_DOWNLOAD_QUEUE_CAPACITY` 调整这两个上限。
+
 任务随代理进程结束，重新发起时复用有效数据。已发布的 MP4 和明文 HLS 优先按源地址的 `host/path` 保存在缓存根目录中，仍参与容量淘汰。需要长期保存时可复制媒体文件，复制 HLS 时需保留播放列表和资源之间的相对位置。

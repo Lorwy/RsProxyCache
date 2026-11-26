@@ -22,6 +22,17 @@ use tokio_rustls::TlsConnector;
 
 pub const TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug)]
+pub(crate) struct OriginAddressDenied;
+
+impl std::fmt::Display for OriginAddressDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no permitted origin address")
+    }
+}
+
+impl std::error::Error for OriginAddressDenied {}
+
 #[derive(Clone)]
 pub struct FinalTarget(pub String);
 
@@ -131,7 +142,9 @@ impl Origin {
             .context("resolve origin host")?
             .filter(|address| self.allow_private || public(address.ip()))
             .collect::<Vec<SocketAddr>>();
-        ensure!(!addresses.is_empty(), "no permitted origin address");
+        if addresses.is_empty() {
+            return Err(OriginAddressDenied.into());
+        }
         let stream = TcpStream::connect(addresses.as_slice())
             .await
             .context("connect to origin")?;

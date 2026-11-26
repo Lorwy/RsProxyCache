@@ -20,6 +20,49 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{fs::File as AsyncFile, io::AsyncWriteExt};
 
+#[derive(Clone, Copy)]
+pub(crate) enum DownloadCacheFailure {
+    Capacity,
+    Write,
+    DiskFull,
+    Publish,
+}
+
+tokio::task_local! {
+    pub(crate) static DOWNLOAD_CACHE_FAILURE: Option<Arc<Mutex<Option<DownloadCacheFailure>>>>;
+}
+
+#[derive(Debug)]
+struct PublicationCapacity;
+
+impl std::fmt::Display for PublicationCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("insufficient space to publish cache")
+    }
+}
+
+pub(crate) fn record_download_failure(failure: DownloadCacheFailure) {
+    let _ = DOWNLOAD_CACHE_FAILURE.try_with(|slot| {
+        if let Some(slot) = slot {
+            let mut current = slot.lock().unwrap();
+            if current.is_none() || matches!(current.as_ref(), Some(DownloadCacheFailure::Capacity))
+            {
+                *current = Some(failure);
+            }
+        }
+    });
+}
+
+fn record_io_failure(error: Option<&std::io::Error>, otherwise: DownloadCacheFailure) {
+    record_download_failure(
+        if error.is_some_and(|error| error.kind() == std::io::ErrorKind::StorageFull) {
+            DownloadCacheFailure::DiskFull
+        } else {
+            otherwise
+        },
+    );
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Metadata {
     pub target: String,
@@ -50,6 +93,8 @@ struct Record {
     published: Option<PathBuf>,
     modified: Option<SystemTime>,
     playlist: Option<PublishedPlaylist>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    playlist_digest: Option<String>,
     span: Range<u64>,
     metadata: Metadata,
 }
@@ -225,15 +270,7 @@ impl Cache {
             let path = item?.path();
             if path.extension().is_some_and(|ext| ext == "json") {
                 match load(dir, &path) {
-                    Ok(entry) => {
-                        if let Some(playlist) = &entry.record.playlist
-                            && hls::is_master(&playlist.original)
-                        {
-                            index
-                                .remember_playlist(&entry.record.source, playlist.original.clone());
-                        }
-                        index.insert(entry);
-                    }
+                    Ok(entry) => index.insert(entry),
                     Err(_) => {
                         cache_warning("load_interval", &"invalid or unreadable cache record");
                         remove(&path);
@@ -253,6 +290,7 @@ impl Cache {
                 remove(&path);
             }
         }
+        index.reconcile_publications();
         let invalid: Vec<_> = index
             .entries
             .values()
@@ -265,6 +303,19 @@ impl Cache {
             .collect();
         for key in invalid {
             index.clear(&key);
+        }
+        let masters: Vec<_> = index
+            .entries
+            .values()
+            .flatten()
+            .filter_map(|entry| {
+                let playlist = entry.record.playlist.as_ref()?;
+                hls::is_master(&playlist.original)
+                    .then(|| (entry.record.source.clone(), playlist.original.clone()))
+            })
+            .collect();
+        for (source, original) in masters {
+            index.remember_playlist(&source, original);
         }
         index.evict(capacity);
         Ok(index)
@@ -306,6 +357,26 @@ impl Cache {
                 .published(&key)
                 .is_some_and(|entry| entry.matches_published_file()),
         }
+    }
+
+    pub(crate) async fn retry_media_publication(self: &Arc<Self>, source: &str) -> Result<()> {
+        let key = key(source);
+        let Some(metadata) = self.metadata(&key) else {
+            return Ok(());
+        };
+        let Some(version) = self.version_for_patch(&key, &metadata) else {
+            return Ok(());
+        };
+        let cache = self.clone();
+        let failure = DOWNLOAD_CACHE_FAILURE.try_with(Clone::clone).ok().flatten();
+        tokio::task::spawn_blocking(move || {
+            DOWNLOAD_CACHE_FAILURE.sync_scope(failure, || {
+                publish_complete(&cache, &version).inspect_err(|error| {
+                    record_io_failure(error.downcast_ref(), DownloadCacheFailure::Publish);
+                })
+            })
+        })
+        .await?
     }
 
     pub(crate) fn observe_playlist(&self, source: &str, canonical: String) {
@@ -382,6 +453,7 @@ impl Cache {
                 true
             }
             Err(error) => {
+                record_io_failure(error.downcast_ref(), DownloadCacheFailure::Write);
                 cache_warning("recover_directory", &format_args!("{error:#}"));
                 false
             }
@@ -480,13 +552,17 @@ impl Cache {
 
     fn reserve(self: &Arc<Self>, size: u64, version: &CacheVersion) -> Option<Reservation> {
         if size == 0 || size > self.capacity {
+            record_download_failure(DownloadCacheFailure::Capacity);
             return None;
         }
         let mut index = self.index.lock().unwrap();
         if !self.refresh_index(&mut index) || !index.is_current(version) {
             return None;
         }
-        index.reserve(self.capacity, size)?;
+        index.reserve(self.capacity, size).or_else(|| {
+            record_download_failure(DownloadCacheFailure::Capacity);
+            None
+        })?;
         Some(Reservation {
             cache: self.clone(),
             size,
@@ -511,7 +587,10 @@ impl Cache {
         }
         let stage = self
             .stage_file()
-            .inspect_err(|error| cache_warning("stage_media", error))
+            .inspect_err(|error| {
+                record_io_failure(error.downcast_ref(), DownloadCacheFailure::Write);
+                cache_warning("stage_media", error);
+            })
             .ok()?;
         drop(index);
         let reservation = Reservation {
@@ -637,6 +716,7 @@ impl Reservation {
             published: None,
             modified: None,
             playlist: None,
+            playlist_digest: None,
             key: version.key.clone(),
             span,
             metadata: version.metadata.clone(),
@@ -646,6 +726,22 @@ impl Reservation {
             "staged length mismatch"
         );
         stage.as_file().sync_data()?;
+        if record.span == (0..version.metadata.size) {
+            let mut index = self.cache.index.lock().unwrap();
+            if !self.cache.refresh_index(&mut index) || !index.is_current(&version) {
+                return Ok(());
+            }
+            if index.published(&version.key).is_none() {
+                published::publish_staged_media(&self.cache.dir, &mut index, &version, stage)
+                    .inspect_err(|error| {
+                        record_io_failure(error.downcast_ref(), DownloadCacheFailure::Publish)
+                    })?;
+                index.reserved -= self.size;
+                self.size = 0;
+                index.publish_playlists(&self.cache.dir, self.cache.capacity);
+            }
+            return Ok(());
+        }
         let Some(mut sidecar) = self.cache.stage(&version)? else {
             return Ok(());
         };
@@ -677,6 +773,7 @@ impl Reservation {
         });
         drop(index);
         if let Err(error) = publish_complete(&self.cache, &version) {
+            record_io_failure(error.downcast_ref(), DownloadCacheFailure::Publish);
             cache_warning("publish_media", &format_args!("{error:#}"));
         }
         let mut index = self.cache.index.lock().unwrap();
@@ -688,6 +785,40 @@ impl Reservation {
 }
 
 impl Index {
+    fn reconcile_publications(&mut self) {
+        for entries in self.entries.values_mut() {
+            let mut paths = HashSet::new();
+            entries.sort_by_key(|entry| std::cmp::Reverse(*entry.used.lock().unwrap()));
+            entries.retain(|entry| {
+                if entry.record.published.is_some() && !paths.insert(entry.path.clone()) {
+                    remove(&entry.sidecar);
+                    self.size -= entry.size();
+                    return false;
+                }
+                true
+            });
+            let published: Vec<_> = entries
+                .iter()
+                .filter(|entry| entry.record.published.is_some() && entry.record.playlist.is_none())
+                .cloned()
+                .collect();
+            entries.retain(|entry| {
+                let superseded = entry.record.published.is_none()
+                    && published.iter().any(|file| {
+                        file.record.metadata == entry.record.metadata
+                            && file.record.span.start <= entry.record.span.start
+                            && file.record.span.end >= entry.record.span.end
+                    });
+                if superseded {
+                    delete(entry);
+                    self.size -= entry.size();
+                }
+                !superseded
+            });
+            entries.sort_by_key(|entry| entry.record.published.is_some());
+        }
+    }
+
     fn reset(&mut self) {
         *self = Self {
             next_version: self.next_version,
@@ -824,6 +955,11 @@ impl Index {
             let sources: Vec<_> = self.playlists.keys().cloned().collect();
             for source in sources {
                 if publish_playlist(root, self, capacity, &source).unwrap_or_else(|error| {
+                    if error.downcast_ref::<PublicationCapacity>().is_some() {
+                        record_download_failure(DownloadCacheFailure::Capacity);
+                    } else {
+                        record_io_failure(error.downcast_ref(), DownloadCacheFailure::Publish);
+                    }
                     cache_warning("publish_playlist", &format_args!("{error:#}"));
                     false
                 }) {
@@ -983,6 +1119,13 @@ fn load(root: &Path, sidecar: &Path) -> Result<Entry> {
                 .is_none_or(|time| metadata.modified().ok() == Some(time)),
         "invalid cache file"
     );
+    if let Some(digest) = &record.playlist_digest {
+        let contents = fs::read_to_string(&path)?;
+        ensure!(
+            key(&contents) == *digest,
+            "published playlist content changed"
+        );
+    }
     let used = if record.published.is_some() {
         fs::metadata(sidecar)?.modified()?
     } else {
@@ -1034,6 +1177,7 @@ impl IntervalWriter {
             if let Some(chunk) = &mut self.chunk
                 && let Err(error) = chunk.file.write_all(&data[..size]).await
             {
+                record_io_failure(Some(&error), DownloadCacheFailure::Write);
                 cache_warning("write_interval", &error);
                 self.chunk = None;
             }
@@ -1070,14 +1214,22 @@ impl WholeWriter {
             if !cache.refresh_index(&mut index) || reservation.generation != index.generation {
                 return None;
             }
-            index.reserve(cache.capacity, bytes.len() as u64)?;
+            index
+                .reserve(cache.capacity, bytes.len() as u64)
+                .or_else(|| {
+                    record_download_failure(DownloadCacheFailure::Capacity);
+                    None
+                })?;
             reservation.size += bytes.len() as u64;
         }
         self.data
             .file
             .write_all(bytes)
             .await
-            .inspect_err(|error| cache_warning("write_media", error))
+            .inspect_err(|error| {
+                record_io_failure(Some(error), DownloadCacheFailure::Write);
+                cache_warning("write_media", error);
+            })
             .ok()?;
         self.data.span.end = reservation.size;
         Some(())
@@ -1109,10 +1261,16 @@ impl StagedInterval {
         let reservation = cache.reserve(span.end - span.start, version)?;
         let stage = cache
             .stage(version)
-            .inspect_err(|error| cache_warning("stage_interval", error))
+            .inspect_err(|error| {
+                record_io_failure(error.downcast_ref(), DownloadCacheFailure::Write);
+                cache_warning("stage_interval", error);
+            })
             .ok()??;
         Self::open(reservation, stage, span)
-            .inspect_err(|error| cache_warning("open_staging_file", error))
+            .inspect_err(|error| {
+                record_io_failure(error.downcast_ref(), DownloadCacheFailure::Write);
+                cache_warning("open_staging_file", error);
+            })
             .ok()
     }
 
@@ -1132,19 +1290,24 @@ impl StagedInterval {
 
     async fn commit(mut self, version: Arc<CacheVersion>) {
         if let Err(error) = self.file.flush().await {
+            record_io_failure(Some(&error), DownloadCacheFailure::Write);
             cache_warning("flush_interval", &error);
             return;
         }
         drop(self.file.into_std().await);
         let span = tracing::Span::current();
+        let failure = DOWNLOAD_CACHE_FAILURE.try_with(Clone::clone).ok().flatten();
         let result = tokio::task::spawn_blocking(move || {
-            span.in_scope(|| self.reservation.commit(self.stage, self.span, version))
+            DOWNLOAD_CACHE_FAILURE.sync_scope(failure, || {
+                span.in_scope(|| self.reservation.commit(self.stage, self.span, version))
+            })
         })
         .await;
         if let Err(error) = result
             .context("cache commit task")
             .and_then(|result| result)
         {
+            record_io_failure(error.downcast_ref(), DownloadCacheFailure::Write);
             cache_warning("commit_interval", &format_args!("{error:#}"));
         }
     }
@@ -1221,5 +1384,322 @@ fn cache_warning(operation: &'static str, error: &dyn std::fmt::Display) {
     {
         last.insert(operation, now);
         tracing::warn!(operation, %error, "cache operation failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SOURCE: &str = "https://example.test/video.mp4";
+
+    fn metadata(etag: Option<&str>) -> Metadata {
+        Metadata {
+            target: key(SOURCE),
+            etag: etag.map(str::to_owned),
+            size: 100,
+            content_type: Some("video/mp4".into()),
+        }
+    }
+
+    async fn store(cache: &Arc<Cache>, version: &Arc<CacheVersion>, span: Range<u64>) {
+        let bytes: Vec<_> = span.clone().map(|offset| offset as u8).collect();
+        let mut writer = cache.writer(version.clone(), span).unwrap();
+        writer.write(&bytes).await;
+        writer.finish().await;
+    }
+
+    const MASTER: &str = "https://example.test/master.m3u8";
+    const FIRST: &str = "https://example.test/first.m3u8";
+    const SECOND: &str = "https://example.test/second.m3u8";
+
+    fn observe_variant(cache: &Cache, source: &str) {
+        cache.observe_playlist(
+            source,
+            format!("#EXTM3U\n#EXTINF:1,\n{SOURCE}\n#EXT-X-ENDLIST\n"),
+        );
+    }
+
+    #[tokio::test]
+    async fn publication_crash_child() {
+        let Some(root) = std::env::var_os("RPC_TEST_PUBLICATION_ROOT") else {
+            return;
+        };
+        let cache = Cache::open(root.into(), 4096).unwrap();
+        if std::env::var("RPC_TEST_PUBLICATION_TARGET").unwrap() == "master.m3u8" {
+            observe_variant(&cache, SECOND);
+        } else {
+            let version = cache
+                .adopt(SOURCE, metadata(Some("\"v1\"")), cache.refresh())
+                .unwrap();
+            store(&cache, &version, 50..100).await;
+        }
+    }
+
+    async fn check_publication_recovery(target: &str) {
+        for step in ["staged", "recorded", "installed", "indexed", "cleaned"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let cache = Cache::open(root.to_owned(), 4096).unwrap();
+            let version = cache
+                .adopt(SOURCE, metadata(Some("\"v1\"")), cache.refresh())
+                .unwrap();
+            let playlist = target == "master.m3u8";
+            store(&cache, &version, if playlist { 0..100 } else { 0..50 }).await;
+            if playlist {
+                observe_variant(&cache, FIRST);
+                cache.observe_playlist(
+                    MASTER,
+                    format!("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=100\n{FIRST}\n#EXT-X-STREAM-INF:BANDWIDTH=200\n{SECOND}\n"),
+                );
+                assert!(!cache.published_playlist(MASTER).unwrap().contains(SECOND));
+            }
+            drop(cache);
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "cache::tests::publication_crash_child"])
+                .env("RPC_TEST_PUBLICATION_ROOT", root)
+                .env("RPC_TEST_PUBLICATION_TARGET", target)
+                .env("RPC_TEST_PUBLICATION_STEP", step)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let marker = root.join("publication-checkpoint");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !marker.is_file()
+                && child.try_wait().unwrap().is_none()
+                && Instant::now() < deadline
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let reached = marker.is_file();
+            let _ = child.kill();
+            child.wait().unwrap();
+            assert!(reached, "child did not reach {target}/{step}");
+            fs::remove_file(marker).unwrap();
+
+            for _ in 0..2 {
+                let cache = Cache::open(root.to_owned(), 4096).unwrap();
+                let installed = matches!(step, "installed" | "indexed" | "cleaned");
+                if playlist {
+                    let master = cache.published_playlist(MASTER).unwrap();
+                    assert!(master.contains(FIRST), "{step}");
+                    assert_eq!(master.contains(SECOND), installed, "{step}");
+                    assert!(cache.published_playlist(FIRST).is_some());
+                    assert!(cache.published_playlist(SECOND).is_some());
+                    assert_eq!(
+                        fs::read(root.join("example.test/video.mp4")).unwrap(),
+                        (0..100).collect::<Vec<u8>>()
+                    );
+                } else {
+                    let path = root.join("example.test/video.mp4");
+                    assert_eq!(path.exists(), installed, "{step}");
+                    if installed {
+                        assert_eq!(fs::read(path).unwrap(), (0..100).collect::<Vec<u8>>());
+                    }
+                    assert_eq!(cache.index.lock().unwrap().size, 100, "{step}");
+                }
+                let internal = root.join(INTERNAL);
+                let entries = fs::read_dir(internal)
+                    .unwrap()
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .unwrap();
+                assert!(
+                    entries.iter().all(|entry| !entry
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".rpc-stage-")),
+                    "{step}"
+                );
+                let index = cache.index.lock().unwrap();
+                assert_eq!(
+                    entries.len(),
+                    index
+                        .entries
+                        .values()
+                        .flatten()
+                        .map(|entry| {
+                            if entry.record.published.is_some() {
+                                1
+                            } else {
+                                2
+                            }
+                        })
+                        .sum::<usize>(),
+                    "{step}"
+                );
+                if playlist {
+                    let media_bytes = fs::read_dir(root.join("example.test"))
+                        .unwrap()
+                        .map(|file| file.unwrap().metadata().unwrap().len())
+                        .sum::<u64>();
+                    assert_eq!(index.size, media_bytes, "{step}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovers_complete_mp4_after_forced_publication_stop() {
+        check_publication_recovery("video.mp4").await;
+    }
+
+    #[tokio::test]
+    async fn recovers_master_and_shared_media_after_forced_publication_stop() {
+        check_publication_recovery("master.m3u8").await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_publications_respect_shared_capacity_and_held_readers() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 150).unwrap();
+        let other_source = "https://example.test/other.mp4";
+        let mut metadata = metadata(Some("\"v1\""));
+        metadata.size = 50;
+        let first = cache
+            .adopt(SOURCE, metadata.clone(), cache.refresh())
+            .unwrap();
+        let second = cache
+            .adopt(other_source, metadata.clone(), cache.refresh())
+            .unwrap();
+        cache.pin(key(SOURCE));
+        cache.pin(key(other_source));
+        store(&cache, &first, 0..25).await;
+        store(&cache, &second, 0..25).await;
+        // Readers can hold interval files after a full file has replaced them.
+        let first_readers = cache.plan(&key(SOURCE), 0..25, &metadata);
+        let second_readers = cache.plan(&key(other_source), 0..25, &metadata);
+        tokio::join!(
+            store(&cache, &first, 25..50),
+            store(&cache, &second, 25..50)
+        );
+
+        let first_published = cache.contains(SOURCE, None);
+        let second_published = cache.contains(other_source, None);
+        assert_ne!(
+            first_published, second_published,
+            "only one full publication fits while intervals are held"
+        );
+        assert_eq!(cache.index.lock().unwrap().reserved, 0);
+        assert!(cache.index.lock().unwrap().size <= cache.capacity());
+        drop((first_readers, second_readers));
+        let missing = if first_published {
+            other_source
+        } else {
+            SOURCE
+        };
+        cache.retry_media_publication(missing).await.unwrap();
+        assert!(cache.contains(SOURCE, None));
+        assert!(cache.contains(other_source, None));
+        assert_eq!(cache.index.lock().unwrap().reserved, 0);
+    }
+
+    #[test]
+    fn disk_full_takes_precedence_over_cache_quota() {
+        let failure = Arc::new(Mutex::new(None));
+        DOWNLOAD_CACHE_FAILURE.sync_scope(Some(failure.clone()), || {
+            record_download_failure(DownloadCacheFailure::Capacity);
+            let error = std::io::Error::from(std::io::ErrorKind::StorageFull);
+            record_io_failure(Some(&error), DownloadCacheFailure::Write);
+        });
+        assert!(matches!(
+            *failure.lock().unwrap(),
+            Some(DownloadCacheFailure::DiskFull)
+        ));
+    }
+
+    #[tokio::test]
+    async fn plans_only_missing_bytes_around_matching_intervals() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 1_024).unwrap();
+        let metadata = metadata(Some("\"v1\""));
+        let version = cache
+            .adopt(SOURCE, metadata.clone(), cache.refresh())
+            .unwrap();
+        store(&cache, &version, 10..25).await;
+        store(&cache, &version, 35..50).await;
+
+        let plan: Vec<_> = cache
+            .plan(&key(SOURCE), 15..55, &metadata)
+            .into_iter()
+            .map(|piece| match piece {
+                Piece::Cached(_, span) => (true, span),
+                Piece::Missing(span) => (false, span),
+            })
+            .collect();
+        assert_eq!(
+            plan,
+            [
+                (true, 15..25),
+                (false, 25..35),
+                (true, 35..50),
+                (false, 50..55)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_combine_intervals_without_a_strong_validator() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 1_024).unwrap();
+        let metadata = metadata(None);
+        let version = cache
+            .adopt(SOURCE, metadata.clone(), cache.refresh())
+            .unwrap();
+        store(&cache, &version, 0..10).await;
+        store(&cache, &version, 10..20).await;
+
+        assert!(
+            matches!(cache.plan(&key(SOURCE), 5..15, &metadata).as_slice(),
+                         [Piece::Missing(span)] if *span == (5..15))
+        );
+        assert!(
+            matches!(cache.plan(&key(SOURCE), 5..10, &metadata).as_slice(),
+                         [Piece::Cached(_, span)] if *span == (5..10))
+        );
+    }
+
+    #[tokio::test]
+    async fn publishes_next_to_a_directory_with_the_preferred_file_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = directory.path().join("example.test");
+        let preferred = host.join("video.mp4");
+        fs::create_dir_all(&preferred).unwrap();
+
+        let cache = Cache::open(directory.path().to_owned(), 1_024).unwrap();
+        let version = cache
+            .adopt(SOURCE, metadata(Some("\"v1\"")), cache.refresh())
+            .unwrap();
+        store(&cache, &version, 0..100).await;
+
+        assert!(preferred.is_dir());
+        let files: Vec<_> = fs::read_dir(host)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.is_file())
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].extension().unwrap(), "mp4");
+        assert_eq!(fs::read(&files[0]).unwrap(), (0..100).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn adopting_a_replacement_rejects_old_pending_writes() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 1_024).unwrap();
+        let old = metadata(Some("\"v1\""));
+        let new = metadata(Some("\"v2\""));
+        let version = cache.adopt(SOURCE, old.clone(), cache.refresh()).unwrap();
+        store(&cache, &version, 0..10).await;
+        let mut pending = cache.writer(version.clone(), 10..20).unwrap();
+        pending.write(&[1; 10]).await;
+
+        let replacement = cache.adopt(SOURCE, new.clone(), cache.refresh()).unwrap();
+        pending.finish().await;
+        assert!(!cache.is_current(&version));
+        assert!(matches!(cache.plan(&key(SOURCE), 0..20, &old).as_slice(),
+                         [Piece::Missing(span)] if *span == (0..20)));
+        store(&cache, &replacement, 0..20).await;
+        assert!(matches!(cache.plan(&key(SOURCE), 0..20, &new).as_slice(),
+                         [Piece::Cached(_, span)] if *span == (0..20)));
     }
 }

@@ -51,12 +51,21 @@ async fn main() -> Result<()> {
         .parse::<bool>()
         .context("invalid RPC_ALLOW_PRIVATE_ORIGINS")?;
 
+    let parallelism = setting("RPC_DOWNLOAD_PARALLELISM", "2")
+        .parse()
+        .context("invalid RPC_DOWNLOAD_PARALLELISM")?;
+    let queue_capacity = setting("RPC_DOWNLOAD_QUEUE_CAPACITY", "16")
+        .parse()
+        .context("invalid RPC_DOWNLOAD_QUEUE_CAPACITY")?;
     let origin_hosts = hosts.len();
     let cache_dir = dir.clone();
-    let playback = Arc::new(playback::Playback::new(
-        cache::Cache::open(dir, capacity)?,
-        origin::Origin::new(hosts, allow_private)?,
-    ));
+    let playback = Arc::new(
+        playback::Playback::new(
+            cache::Cache::open(dir, capacity)?,
+            origin::Origin::new(hosts, allow_private)?,
+        )
+        .with_download_limits(parallelism, queue_capacity)?,
+    );
     let listener = TcpListener::bind(setting("RPC_LISTEN", "127.0.0.1:8080")).await?;
     tracing::info!(listen = %listener.local_addr()?, cache_dir = %cache_dir.display(), capacity_bytes = capacity, origin_hosts, allow_private, "listening on configured address");
     Ok(rs_proxy_cache::serve(listener, playback).await?)

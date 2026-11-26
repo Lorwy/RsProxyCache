@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, ensure};
@@ -246,8 +246,16 @@ impl Playback {
         let guard = if head {
             None
         } else {
-            Some(self.lock(&format!("{key}:{}", requested.upstream())).await)
+            let lock_key = format!("{key}:{}", requested.upstream());
+            let wait = match requested {
+                Requested::Whole | Requested::From(_, None) => Duration::from_millis(75),
+                Requested::From(_, Some(_)) | Requested::Suffix(_) => Duration::from_millis(500),
+            };
+            timeout(wait, self.lock(&lock_key)).await.ok()
         };
+        // A player may open a new connection before draining an earlier response.
+        // After a bounded wait, relay a fresh response without competing for its cache writes.
+        let bypass_cache = !head && guard.is_none();
         let generation = self.cache.refresh();
         let previous = self.cache.metadata(&key);
         if head {
@@ -266,7 +274,9 @@ impl Playback {
             return relay_headers(origin.status(), origin.headers(), empty());
         }
 
-        if let Some(metadata) = &previous {
+        if let Some(metadata) = &previous
+            && !bypass_cache
+        {
             if let Some(span) = requested.resolve(metadata.size) {
                 match self.prepare(source, &key, span.clone(), metadata).await? {
                     Prepared::Parts(parts) => {
@@ -319,7 +329,11 @@ impl Playback {
                     requested.resolve(metadata.size).as_ref() == Some(&span),
                     "unexpected origin byte range"
                 );
-                let version = self.cache.adopt(source, metadata.clone(), generation);
+                let version = if bypass_cache {
+                    None
+                } else {
+                    self.cache.adopt(source, metadata.clone(), generation)
+                };
                 let part = Part::RemoteRange {
                     body: origin.into_body(),
                     version,
@@ -334,16 +348,17 @@ impl Playback {
                 let status = origin.status();
                 let headers = origin.headers().clone();
                 let length = content_length(&headers)?;
-                let part = if resource == Some(Resource::Media)
-                    || uri
-                        .path()
-                        .as_bytes()
-                        .last_chunk::<4>()
-                        .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".mp4"))
-                    || headers
-                        .get(header::CONTENT_TYPE)
-                        .and_then(|value| value.to_str().ok())
-                        .is_some_and(|value| value.starts_with("video/"))
+                let part = if !bypass_cache
+                    && (resource == Some(Resource::Media)
+                        || uri
+                            .path()
+                            .as_bytes()
+                            .last_chunk::<4>()
+                            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b".mp4"))
+                        || headers
+                            .get(header::CONTENT_TYPE)
+                            .and_then(|value| value.to_str().ok())
+                            .is_some_and(|value| value.starts_with("video/")))
                 {
                     let metadata = origin_metadata(&origin, length.unwrap_or_default())?;
                     let writer = self
@@ -645,7 +660,11 @@ impl Playback {
     ) -> Body {
         let (sender, receiver) = mpsc::channel(4);
         let playback = self.clone();
-        tokio::spawn(async move {
+        let failure = cache::DOWNLOAD_CACHE_FAILURE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        tokio::spawn(cache::DOWNLOAD_CACHE_FAILURE.scope(failure, async move {
             let _guard = guard;
             for part in parts {
                 let result = match part {
@@ -691,12 +710,17 @@ impl Playback {
                         tracing::debug!("client closed playback response");
                     } else {
                         tracing::warn!(error = %format_args!("{error:#}"), "playback stream interrupted");
-                        let _ = sender.send(Err(io::Error::other(error))).await;
+                        let kind = if error.downcast_ref::<tokio::time::error::Elapsed>().is_some() {
+                            io::ErrorKind::TimedOut
+                        } else {
+                            io::ErrorKind::Other
+                        };
+                        let _ = sender.send(Err(io::Error::new(kind, error))).await;
                     }
                     break;
                 }
             }
-        }.in_current_span());
+        }.in_current_span()));
         StreamBody::new(stream::unfold(receiver, |mut receiver| async {
             receiver.recv().await.map(|frame| (frame, receiver))
         }))

@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import contextlib
+import hashlib
 import http.client
 import http.server
 import json
@@ -9,7 +10,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
@@ -18,6 +18,7 @@ import unittest
 
 
 BINARY = Path(os.environ.get("RPC_TEST_BINARY", "target/debug/rs-proxy-cache")).resolve()
+FFMPEG = None if os.environ.get("RPC_TEST_SKIP_FFMPEG") == "1" else shutil.which("ffmpeg")
 SIGNED_PATH = "/video%2Emp4?token=a%2Fb&expires=123"
 
 
@@ -89,11 +90,17 @@ class Origin(http.server.BaseHTTPRequestHandler):
             if state.delay:
                 time.sleep(state.delay)
             try:
-                if state.block_range and requested == state.block_range:
+                if self.path == state.block_path or (state.block_range and requested == state.block_range):
                     state.release_range.wait(5)
+                if requested and requested == state.pause_body_range:
+                    middle = (start + end) // 2
+                    self.wfile.write(data[start:middle])
+                    self.wfile.flush()
+                    state.release_range.wait(state.body_pause_seconds)
+                    start = middle
                 stop = (start + end) // 2 if state.truncate else end
+                written = self.wfile.write(data[start:stop])
                 with state.transfer_lock:
-                    written = self.wfile.write(data[start:stop])
                     state.transfers.append((self.path, requested, written))
                 if state.truncate:
                     self.close_connection = True
@@ -103,13 +110,15 @@ class Origin(http.server.BaseHTTPRequestHandler):
 
 
 class PlaybackTests(unittest.TestCase):
+    origin_handler = Origin
+
     def setUp(self):
         self.root = self.enterContext(tempfile.TemporaryDirectory())
         self.cache = Path(self.root) / "cache"
-        origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+        origin = http.server.ThreadingHTTPServer(("127.0.0.1", 0), self.origin_handler)
         self.origin = origin
         self.addCleanup(origin.server_close)
-        threading.Thread(target=origin.serve_forever, daemon=True).start()
+        threading.Thread(target=origin.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
         self.addCleanup(origin.shutdown)
         origin.unsized = set()
         origin.resources = {}
@@ -122,36 +131,50 @@ class PlaybackTests(unittest.TestCase):
         origin.etag = '"one"'
         origin.expired = origin.ignore_range = origin.truncate = False
         origin.delay = 0
-        origin.block_range = None
+        origin.block_range = origin.block_path = None
+        origin.pause_body_range = None
+        origin.body_pause_seconds = 5
         origin.release_range = threading.Event()
         self.source = f"http://127.0.0.1:{origin.server_port}"
         self.proxy = None
         self.addCleanup(self.stop)
 
-    def start(self, capacity=1024, private=True, log_level="info"):
-        with socket.socket() as sock:
-            sock.bind(("127.0.0.1", 0))
-            self.port = sock.getsockname()[1]
-        self.proxy = subprocess.Popen(
-            [BINARY],
-            env={**os.environ, "RPC_LISTEN": f"127.0.0.1:{self.port}",
-                 "RPC_ORIGIN_HOSTS": "127.0.0.1",
-                 "RPC_ALLOW_PRIVATE_ORIGINS": str(private).lower(),
-                 "RPC_CACHE_DIR": str(self.cache), "RPC_CACHE_BYTES": str(capacity),
-                 "RPC_LOG_LEVEL": log_level},
-            stderr=subprocess.PIPE,
-        )
-        while line := self.proxy.stderr.readline().decode():
-            if "listening on" in line:
-                break
-        self.assertIn("listening on", line)
+    def start(self, capacity=1024, private=True, log_level="info", parallelism=2, queue_capacity=16):
+        self.proxy_log = Path(self.root) / "proxy.log"
+        with self.proxy_log.open("wb") as log:
+            self.proxy = subprocess.Popen(
+                [BINARY],
+                env={**os.environ, "RPC_LISTEN": "127.0.0.1:0",
+                     "RPC_ORIGIN_HOSTS": "127.0.0.1",
+                     "RPC_ALLOW_PRIVATE_ORIGINS": str(private).lower(),
+                     "RPC_CACHE_DIR": str(self.cache), "RPC_CACHE_BYTES": str(capacity),
+                     "RPC_LOG_LEVEL": log_level,
+                     "RPC_DOWNLOAD_PARALLELISM": str(parallelism),
+                     "RPC_DOWNLOAD_QUEUE_CAPACITY": str(queue_capacity)},
+                stderr=log,
+            )
+        deadline = time.monotonic() + 5
+        while True:
+            logs = self.proxy_log.read_text(encoding="utf-8", errors="replace")
+            ready = re.search(r"listening on configured address listen=127\.0\.0\.1:(\d+)", logs)
+            if ready:
+                self.port = int(ready[1])
+                return
+            if self.proxy.poll() is not None or time.monotonic() >= deadline:
+                self.fail(f"Proxy failed to start (exit={self.proxy.poll()}):\n{logs}")
+            time.sleep(0.01)
 
     def stop(self):
         if self.proxy is not None:
-            self.proxy.terminate()
-            _, logs = self.proxy.communicate(timeout=5)
+            if self.proxy.poll() is None:
+                self.proxy.terminate()
+            try:
+                self.proxy.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proxy.kill()
+                self.proxy.wait(timeout=5)
             self.proxy = None
-            return logs.decode()
+            return self.proxy_log.read_text(encoding="utf-8", errors="replace")
 
     def get(self, spec=None, path=SIGNED_PATH, method="GET", headers_received=None, proxy_path=None):
         headers = {"Range": f"bytes={spec}"} if spec is not None else {}
@@ -203,6 +226,63 @@ class PlaybackTests(unittest.TestCase):
         self.assertFalse(original.exists())
         self.assertEqual(alternate.read_bytes(), b"B" * 200)
 
+    def test_whole_mp4_publishes_at_exact_capacity(self):
+        self.start(capacity=len(self.origin.data))
+        self.assertEqual(self.get(path="/quota/whole.mp4")[2], self.origin.data)
+        published = self.cache / "127.0.0.1" / "quota" / "whole.mp4"
+        self.assertEqual(published.read_bytes(), self.origin.data)
+
+    def test_fragmented_mp4_publishes_at_exact_publication_capacity(self):
+        self.start(capacity=2 * len(self.origin.data))
+        path = "/quota/exact.mp4"
+        self.assertEqual(self.get("0-99", path=path)[2], self.origin.data[:100])
+        self.assertEqual(self.get("100-199", path=path)[2], self.origin.data[100:])
+        published = self.cache / "127.0.0.1" / "quota" / "exact.mp4"
+        self.assertEqual(published.read_bytes(), self.origin.data)
+        self.assertEqual(list((self.cache / ".rpc").glob("*.part")), [])
+
+    def test_fragmented_mp4_preserves_ranges_without_publication_headroom(self):
+        self.start(capacity=2 * len(self.origin.data) - 1)
+        path = "/quota/fragmented.mp4"
+        self.assertEqual(self.get("0-99", path=path)[2], self.origin.data[:100])
+        self.assertEqual(self.get("100-199", path=path)[2], self.origin.data[100:])
+        self.assertFalse((self.cache / "127.0.0.1" / "quota" / "fragmented.mp4").exists())
+        self.origin.expired = True
+        self.assertEqual(self.get(path=path)[2], self.origin.data)
+
+    def test_offline_queue_is_bounded_and_cancelled_work_never_fetches(self):
+        self.start(parallelism=1, queue_capacity=1)
+        self.origin.block_path = "/active.mp4"
+
+        def task_request(source, method="GET"):
+            status, _, body = self.get(method=method, proxy_path="/v1/offline/" + self.source + source)
+            return status, json.loads(body)
+
+        def await_state(source, state):
+            deadline = time.monotonic() + 3
+            while True:
+                _, progress = task_request(source)
+                if progress["state"] == state:
+                    return
+                self.assertLess(time.monotonic(), deadline, progress)
+                time.sleep(0.01)
+
+        self.assertFalse(task_request("/active.mp4", "POST")[1]["queued"])
+        self.assertTrue(task_request("/cancelled.mp4", "POST")[1]["queued"])
+        self.assertTrue(task_request("/cancelled.mp4", "POST")[1]["queued"])
+        status, progress = task_request("/next.mp4", "POST")
+        self.assertEqual((status, progress["error_code"]), (429, "queue_full"))
+        task_request("/cancelled.mp4", "DELETE")
+        await_state("/cancelled.mp4", "cancelled")
+        self.assertTrue(task_request("/next.mp4", "POST")[1]["queued"])
+        self.assertEqual(self.get(path="/playing.mp4")[2], self.origin.data)
+        untouched = {"/cancelled.mp4", "/next.mp4"}
+        self.assertFalse(any(path in untouched for _, path, _ in self.origin.requests))
+        self.origin.release_range.set()
+        await_state("/active.mp4", "completed")
+        await_state("/next.mp4", "completed")
+        self.assertFalse(any(path == "/cancelled.mp4" for _, path, _ in self.origin.requests))
+
     def test_offline_task_publishes_mp4_and_reports_completion(self):
         self.start()
         path = "/v1/offline/" + self.source + "/download/movie.mp4"
@@ -221,6 +301,151 @@ class PlaybackTests(unittest.TestCase):
         self.assertEqual(task["processed_bytes"], len(self.origin.data))
         published = self.cache / "127.0.0.1" / "download" / "movie.mp4"
         self.assertEqual(published.read_bytes(), self.origin.data)
+
+    def test_offline_reports_capacity_write_and_publication_failures(self):
+        self.start(capacity=400)
+
+        self.origin.resources["/oversized.mp4"] = ("video/mp4", b"x" * 401)
+        self.assertEqual(self.await_offline_task("/oversized.mp4")["state"], "insufficient_capacity")
+
+        self.stop()
+        self.cache = Path(self.root) / "write-failure-cache"
+        self.start(capacity=400)
+        store = self.cache / ".rpc"
+        store.rmdir()
+        store.write_text("blocks staging", encoding="utf-8")
+        try:
+            task = self.await_offline_task("/write.mp4")
+            self.assertEqual((task["state"], task["error_code"]), ("failed", "cache_write_failed"))
+        finally:
+            store.unlink()
+            store.mkdir()
+        self.assertEqual(self.await_offline_task("/write.mp4")["state"], "completed")
+
+        self.stop()
+        self.cache = Path(self.root) / "fragmented-cache"
+        self.start(capacity=400)
+        self.assertEqual(self.get("0-99", path="/blocked/movie.mp4")[2], self.origin.data[:100])
+        folder = self.cache / "127.0.0.1" / "blocked"
+        folder.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256((self.source + "/blocked/movie.mp4").encode()).hexdigest()[:12]
+        blocker = folder / "movie.mp4"
+        alternate = folder / f"movie~{digest}.mp4"
+        for path in (blocker, alternate):
+            path.write_text("blocks publishing", encoding="utf-8")
+        task = self.await_offline_task("/blocked/movie.mp4")
+        self.assertEqual((task["state"], task["error_code"]), ("failed", "publish_failed"))
+        self.assertEqual(self.get(path="/blocked/movie.mp4")[2], self.origin.data)
+        blocker.unlink()
+        alternate.unlink()
+        previous = len(self.origin.requests)
+        self.assertEqual(self.await_offline_task("/blocked/movie.mp4")["state"], "completed")
+        self.assertEqual(len(self.origin.requests), previous)
+
+    @unittest.skipUnless(os.environ.get("RPC_TEST_DISK_FULL_ROOT"), "requires a small disposable test volume")
+    def test_offline_reports_real_disk_full_and_retries(self):
+        import errno
+
+        volume = Path(os.environ["RPC_TEST_DISK_FULL_ROOT"]).resolve()
+        self.assertTrue(volume.is_mount(), "use a dedicated mounted test volume")
+        total = shutil.disk_usage(volume).total
+        self.assertLessEqual(total, 48 * 1024 * 1024, "refusing to fill a large volume")
+        folder = self.enterContext(tempfile.TemporaryDirectory(dir=volume))
+        self.cache = Path(folder) / "cache"
+        self.start(capacity=16 * 1024 * 1024)
+        self.addCleanup(self.stop)
+        source = "/disk-full.mp4"
+        data = b"x" * (4 * 1024 * 1024)
+        self.origin.resources[source] = ("video/mp4", data)
+
+        filler = Path(folder) / "filler"
+        try:
+            with filler.open("wb", buffering=0) as stream:
+                with self.assertRaises(OSError) as error:
+                    block = bytes(64 * 1024)
+                    while True:
+                        stream.write(block)
+                self.assertEqual(error.exception.errno, errno.ENOSPC)
+                stream.truncate(max(0, stream.tell() - 256 * 1024))
+            result = self.await_offline_task(source)
+            self.assertEqual((result["state"], result["error_code"]), ("failed", "disk_full"))
+            self.assertEqual(self.get(path=source)[2], data)
+        finally:
+            filler.unlink(missing_ok=True)
+        self.assertEqual(self.await_offline_task(source)["state"], "completed")
+        self.assertEqual((self.cache / "127.0.0.1" / "disk-full.mp4").read_bytes(), data)
+        self.stop()
+
+    def test_offline_reports_disallowed_origin_address(self):
+        self.start(private=False)
+        task = self.await_offline_task("/blocked-address.mp4")
+        self.assertEqual((task["state"], task["error_code"]), ("failed", "origin_address_denied"))
+        self.assertEqual(self.origin.requests, [])
+
+    def test_offline_truncated_body_reports_failure_and_can_retry(self):
+        self.start()
+        source = "/offline-truncated.mp4"
+        self.origin.truncate = True
+        self.assertEqual(self.await_offline_task(source)["error_code"], "origin_body_failed")
+        self.assertFalse((self.cache / "127.0.0.1" / "offline-truncated.mp4").exists())
+        self.origin.truncate = False
+        self.assertEqual(self.await_offline_task(source)["state"], "completed")
+
+    @unittest.skipUnless(os.environ.get("RPC_TEST_FULL") == "1", "network timeout is checked in full verification")
+    def test_offline_stalled_body_reports_origin_timeout(self):
+        self.start()
+        source = "/offline-timeout.mp4"
+        self.origin.pause_body_range = "bytes=0-"
+        self.origin.body_pause_seconds = 40
+        try:
+            result = self.await_offline_task(source, timeout=35)
+            self.assertEqual((result["state"], result["error_code"]), ("failed", "origin_timeout"))
+        finally:
+            self.origin.release_range.set()
+        self.assertFalse((self.cache / "127.0.0.1" / "offline-timeout.mp4").exists())
+        self.assertEqual(self.await_offline_task(source)["state"], "completed")
+
+    def await_offline_task(self, source, timeout=5):
+        path = "/v1/offline/" + self.source + source
+        self.assertEqual(self.get(method="POST", proxy_path=path)[0], 202)
+        deadline = time.monotonic() + timeout
+        while True:
+            status, _, body = self.get(proxy_path=path)
+            self.assertEqual(status, 200)
+            task = json.loads(body)
+            if task["state"] != "running":
+                return task
+            self.assertLess(time.monotonic(), deadline, task)
+            time.sleep(0.05)
+
+    def test_failed_offline_download_can_retry_and_publish(self):
+        self.start()
+        source = "/retry/movie.mp4"
+        path = "/v1/offline/" + self.source + source
+        published = self.cache / "127.0.0.1" / "retry" / "movie.mp4"
+        self.assertEqual(self.get("0-99", path=source)[2], self.origin.data[:100])
+        self.origin.fail_range = "bytes=100-199"
+
+        def run_download():
+            self.assertEqual(self.get(method="POST", proxy_path=path)[0], 202)
+            deadline = time.monotonic() + 5
+            while True:
+                status, _, body = self.get(proxy_path=path)
+                self.assertEqual(status, 200)
+                task = json.loads(body)
+                if task["state"] != "running":
+                    return task
+                self.assertLess(time.monotonic(), deadline, task)
+                time.sleep(0.01)
+
+        failure = run_download()
+        self.assertEqual((failure["state"], failure["error_code"]), ("failed", "origin_response"))
+        self.assertFalse(published.exists())
+        self.origin.fail_range = None
+        self.assertEqual(run_download()["state"], "completed")
+        self.assertEqual(published.read_bytes(), self.origin.data)
+        self.assertEqual([span for method, _, span in self.origin.requests if method == "GET"],
+                         ["bytes=0-99", "bytes=100-199", "bytes=100-199"])
 
     def test_offline_task_adds_requested_hls_variant_to_existing_master(self):
         self.start(capacity=8192)
@@ -485,7 +710,7 @@ unsized.ts
                 )
                 self.assertEqual(self.get(path=path)[0], 502)
 
-    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is optional")
+    @unittest.skipUnless(FFMPEG, "requires FFmpeg")
     def test_ffmpeg_decodes_and_seeks_hls_ts_and_fmp4(self):
         self.start(capacity=8 * 1024 * 1024)
         for segment_type in ("mpegts", "fmp4"):
@@ -493,7 +718,7 @@ unsized.ts
                 directory = Path(self.root) / segment_type
                 directory.mkdir()
                 subprocess.run([
-                    "ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+                    FFMPEG, "-v", "error", "-f", "lavfi", "-i",
                     "testsrc2=size=160x90:rate=10", "-t", "6", "-c:v", "libx264",
                     "-g", "10", "-sc_threshold", "0", "-hls_time", "1",
                     "-hls_playlist_type", "vod", "-hls_segment_type", segment_type,
@@ -505,12 +730,28 @@ unsized.ts
                         else "video/mp2t" if asset.suffix == ".ts" else "video/mp4",
                         asset.read_bytes(),
                     )
+                def decode(address, input_seek=True):
+                    seek = ["-ss", "4"]
+                    source_args = ["-i", str(address)]
+                    args = seek + source_args if input_seek else source_args + seek
+                    result = subprocess.run([
+                        FFMPEG, "-v", "error", *args, "-frames:v", "4",
+                        "-f", "framehash", "-",
+                    ], check=True, timeout=20, capture_output=True)
+                    return re.findall(rb"(?m)^0,.*", result.stdout)
+
+                fixture = directory / "movie.m3u8"
+                expected = decode(fixture)
+                input_seek = True
+                if segment_type == "fmp4" and not expected:
+                    # FFmpeg 5.1 can fail to seek even in its own local fMP4 HLS output.
+                    # Select the decode mode with the original files before using the proxy.
+                    input_seek = False
+                    expected = decode(fixture, input_seek)
+                self.assertEqual(len(expected), 4)
                 url = f"http://127.0.0.1:{self.port}/v1/{self.source}/{segment_type}/movie.m3u8"
-                decoded = subprocess.run([
-                    "ffmpeg", "-v", "error", "-ss", "4", "-i", url,
-                    "-frames:v", "4", "-f", "framehash", "-",
-                ], check=True, timeout=20, capture_output=True)
-                self.assertEqual(len(re.findall(rb"(?m)^0,", decoded.stdout)), 4)
+                decoded = decode(url, input_seek)
+                self.assertEqual(decoded, expected)
                 self.assertTrue(any(item[1].startswith(f"/{segment_type}/movie4")
                                     for item in self.origin.requests))
                 offline = f"/v1/offline/{self.source}/{segment_type}/movie.m3u8"
@@ -525,13 +766,10 @@ unsized.ts
                 published = self.cache / "127.0.0.1" / segment_type / "movie.m3u8"
                 self.origin.expired = True
                 try:
-                    local = subprocess.run([
-                        "ffmpeg", "-v", "error", "-ss", "4", "-i", str(published),
-                        "-frames:v", "4", "-f", "framehash", "-",
-                    ], check=True, timeout=20, capture_output=True)
+                    local = decode(published, input_seek)
                 finally:
                     self.origin.expired = False
-                self.assertEqual(local.stdout, decoded.stdout)
+                self.assertEqual(local, decoded)
 
     def test_ranges_hits_restart_expiry_and_clear(self):
         self.start()
@@ -613,6 +851,46 @@ unsized.ts
         self.assertEqual(logs.count('operation="recover_directory"'), 1)
         self.assertIn("cache directory recovered", logs)
 
+    def test_staging_failure_keeps_playing_and_later_caches(self):
+        self.start()
+        store = self.cache / ".rpc"
+        store.rmdir()
+        store.write_text("blocks staging", encoding="utf-8")
+        try:
+            for _ in range(2):
+                status, _, body = self.get("20-39")
+                self.assertEqual((status, body), (206, self.origin.data[20:40]))
+        finally:
+            store.unlink()
+            store.mkdir()
+
+        self.assertEqual(self.get("20-39")[2], self.origin.data[20:40])
+        self.assertEqual(self.get("20-39")[2], self.origin.data[20:40])
+        self.assertEqual([span for _, _, span in self.origin.requests], ["bytes=20-39"] * 3)
+        self.assertIn("stage_interval", self.stop())
+
+    def test_restart_cleans_up_interrupted_write_and_caches_on_retry(self):
+        self.start()
+        self.origin.pause_body_range = "bytes=20-39"
+        store = self.cache / ".rpc"
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)) as conn:
+            conn.request("GET", "/v1/" + self.source + SIGNED_PATH, headers={"Range": "bytes=20-39"})
+            response = conn.getresponse()
+            self.assertEqual(response.status, 206)
+            self.assertEqual(response.read(10), self.origin.data[20:30])
+            self.assertTrue(list(store.glob(".rpc-stage-*")))
+            self.proxy.kill()
+            self.proxy.wait(timeout=5)
+        self.stop()
+        self.origin.release_range.set()
+        self.origin.pause_body_range = None
+
+        self.start()
+        self.assertFalse(list(store.glob(".rpc-stage-*")))
+        self.assertEqual(self.get("20-39")[2], self.origin.data[20:40])
+        self.assertEqual(self.get("20-39")[2], self.origin.data[20:40])
+        self.assertEqual([span for _, _, span in self.origin.requests], ["bytes=20-39"] * 2)
+
     def test_deleted_interval_after_headers_requires_same_version(self):
         self.start()
         for expected_same_version in (True, False):
@@ -691,6 +969,21 @@ unsized.ts
             results = list(pool.map(self.get, ["40-59", "40-59"]))
         self.assertEqual([result[2] for result in results], [self.origin.data[40:60]] * 2)
         self.assertEqual(len(self.origin.requests), 1)
+
+    def test_reopened_range_does_not_wait_for_previous_response_to_drain(self):
+        self.start(capacity=1024)
+        self.origin.block_range = "bytes=0-"
+        # The first response has headers, but no bytes and no completed cache reservation.
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)) as conn:
+            conn.request("GET", "/v1/" + self.source + SIGNED_PATH, headers={"Range": "bytes=0-"})
+            self.assertEqual(conn.getresponse().status, 206)
+            with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)) as reopened:
+                reopened.request("GET", "/v1/" + self.source + SIGNED_PATH, headers={"Range": "bytes=0-"})
+                try:
+                    self.assertEqual(reopened.getresponse().status, 206)
+                    self.assertEqual(len(self.origin.requests), 2)
+                finally:
+                    self.origin.release_range.set()
 
     def test_different_playback_ranges_share_the_same_gap(self):
         self.start()
@@ -809,17 +1102,17 @@ unsized.ts
         self.assertEqual([item[1] for item in self.origin.requests],
                          ["/redirect", SIGNED_PATH, "/denied-redirect"])
 
-    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg is optional")
+    @unittest.skipUnless(FFMPEG, "requires FFmpeg")
     def test_ffmpeg_decodes_and_seeks_a_real_mp4(self):
         self.start(capacity=2 * 1024 * 1024)
         mp4 = Path(self.root) / "generated.mp4"
-        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i",
+        subprocess.run([FFMPEG, "-v", "error", "-f", "lavfi", "-i",
                         "testsrc2=size=640x360:rate=24", "-t", "12", "-c:v", "mpeg4",
                         "-g", "12", "-q:v", "3", "-movflags", "+faststart", str(mp4)], check=True, timeout=20)
         self.origin.mp4 = mp4.read_bytes()
         path = "/playable.mp4?sig=a%2Fb&z=1"
         url = f"http://127.0.0.1:{self.port}/v1/{self.source}{path}"
-        subprocess.run(["ffmpeg", "-v", "error", "-ss", "9", "-short_seek_size", "0", "-i", url,
+        subprocess.run([FFMPEG, "-v", "error", "-ss", "9", "-short_seek_size", "0", "-i", url,
                         "-frames:v", "4", "-f", "null", "-"], check=True, timeout=20)
         self.assertTrue(all(item[1] == path for item in self.origin.requests))
         self.assertTrue(any(item[2] and item[2] != "bytes=0-" for item in self.origin.requests))

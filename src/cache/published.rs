@@ -83,9 +83,9 @@ fn media_path(root: &Path, version: &CacheVersion) -> Result<PathBuf> {
     Ok(directory.join(name))
 }
 
-pub(super) fn publish_complete(cache: &Cache, version: &CacheVersion) -> Result<()> {
+pub(super) fn publish_complete(cache: &Arc<Cache>, version: &CacheVersion) -> Result<()> {
     let wanted = 0..version.metadata.size;
-    let (covering, stage) = {
+    let (covering, stage, reservation) = {
         let mut index = cache.index.lock().unwrap();
         if !cache.refresh_index(&mut index)
             || !index.is_current(version)
@@ -102,8 +102,17 @@ pub(super) fn publish_complete(cache: &Cache, version: &CacheVersion) -> Result<
             return Ok(());
         };
         let stage = cache.stage_file()?;
+        if index.reserve(cache.capacity, wanted.end).is_none() {
+            record_download_failure(DownloadCacheFailure::Capacity);
+            return Ok(());
+        }
         index.publishing.insert(version.id);
-        (covering, stage)
+        let reservation = Reservation {
+            cache: cache.clone(),
+            size: wanted.end,
+            generation: index.generation,
+        };
+        (covering, stage, reservation)
     };
     let mut stage = stage;
     let copied =
@@ -112,20 +121,36 @@ pub(super) fn publish_complete(cache: &Cache, version: &CacheVersion) -> Result<
     let mut index = cache.index.lock().unwrap();
     index.publishing.remove(&version.id);
     copied?;
-    if !cache.refresh_index(&mut index) || !index.is_current(version) {
+    if !cache.refresh_index(&mut index)
+        || !index.is_current(version)
+        || index.published(&version.key).is_some()
+    {
         return Ok(());
     }
-    let path = media_path(&cache.dir, version)?;
+    let result = publish_staged_media(&cache.dir, &mut index, version, stage);
+    drop(index);
+    drop(reservation);
+    result
+}
+
+pub(super) fn publish_staged_media(
+    root: &Path,
+    index: &mut Index,
+    version: &CacheVersion,
+    stage: tempfile::NamedTempFile,
+) -> Result<()> {
+    let path = media_path(root, version)?;
     let record = Record {
         source: version.source.clone(),
         key: version.key.clone(),
         metadata: version.metadata.clone(),
-        span: wanted,
-        published: Some(path.strip_prefix(&cache.dir)?.to_path_buf()),
+        span: 0..version.metadata.size,
+        published: Some(path.strip_prefix(root)?.to_path_buf()),
         modified: Some(stage.as_file().metadata()?.modified()?),
         playlist: None,
+        playlist_digest: None,
     };
-    persist_published(&cache.dir, &mut index, stage, record, path)
+    persist_published(root, index, stage, record, path)
 }
 
 pub(super) fn covering_entries(
@@ -196,6 +221,8 @@ fn persist_published(
     record: Record,
     path: PathBuf,
 ) -> Result<()> {
+    #[cfg(test)]
+    publication_checkpoint(root, &path, "staged");
     let internal = root.join(INTERNAL);
     let mut sidecar = tempfile::Builder::new()
         .prefix(".rpc-stage-")
@@ -210,6 +237,8 @@ fn persist_published(
         .context("invalid staging name")?;
     let sidecar_path = internal.join(format!("{id}.json"));
     sidecar.persist_noclobber(&sidecar_path)?;
+    #[cfg(test)]
+    publication_checkpoint(root, &path, "recorded");
     let replaces_playlist = record.playlist.is_some()
         && index.published(&record.key).is_some_and(|entry| {
             entry.path == path && entry.record.playlist.is_some() && entry.matches_published_file()
@@ -223,34 +252,53 @@ fn persist_published(
         remove(&sidecar_path);
         return Err(error.into());
     }
+    #[cfg(test)]
+    publication_checkpoint(root, &path, "installed");
     let replace_intervals = record.span == (0..record.metadata.size);
     let entries = index.entries.remove(&record.key).unwrap_or_default();
+    let key = record.key.clone();
+    index.insert(Entry {
+        record,
+        path: path.clone(),
+        sidecar: sidecar_path,
+        used: Mutex::new(SystemTime::now()),
+        retired: AtomicBool::new(false),
+    });
+    #[cfg(test)]
+    publication_checkpoint(root, &path, "indexed");
     for entry in entries {
         if replaces_playlist && entry.path == path {
             remove(&entry.sidecar);
-            index.size -= entry.size();
+            index.retired.push((Arc::downgrade(&entry), entry.size()));
             continue;
         }
         if entry.record.published.is_some() || !replace_intervals {
-            index
-                .entries
-                .entry(record.key.clone())
-                .or_default()
-                .push(entry);
+            index.entries.get_mut(&key).unwrap().push(entry);
             continue;
         }
         entry.retired.store(true, Ordering::Release);
         remove(&entry.sidecar);
         index.retired.push((Arc::downgrade(&entry), entry.size()));
     }
-    index.insert(Entry {
-        record,
-        path,
-        sidecar: sidecar_path,
-        used: Mutex::new(SystemTime::now()),
-        retired: AtomicBool::new(false),
-    });
+    index.entries.get_mut(&key).unwrap().rotate_left(1);
+    #[cfg(test)]
+    publication_checkpoint(root, &path, "cleaned");
     Ok(())
+}
+
+#[cfg(test)]
+fn publication_checkpoint(root: &Path, path: &Path, step: &str) {
+    let Ok(target) = std::env::var("RPC_TEST_PUBLICATION_TARGET") else {
+        return;
+    };
+    if path.file_name().and_then(|name| name.to_str()) == Some(&target)
+        && std::env::var("RPC_TEST_PUBLICATION_STEP").as_deref() == Ok(step)
+    {
+        fs::write(root.join("publication-checkpoint"), step).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
 }
 
 fn relative_uri(from: &Path, to: &Path) -> Result<String> {
@@ -394,17 +442,12 @@ pub(super) fn publish_playlist(
         })?
     };
     metadata.size = local.len() as u64;
-    let old_size = existing
-        .as_ref()
-        .filter(|entry| entry.path == path)
-        .map_or(0, |entry| entry.size());
-    let needed = metadata.size.saturating_sub(old_size);
-    if needed > 0 {
-        let Some(()) = index.reserve(capacity, needed) else {
-            return Ok(false);
-        };
-        index.reserved -= needed;
+    if index.reserve(capacity, metadata.size).is_none() {
+        record_download_failure(DownloadCacheFailure::Capacity);
+        return Ok(false);
     }
+    // The index remains locked through the write and commit.
+    index.reserved -= metadata.size;
     let mut stage = tempfile::Builder::new()
         .prefix(".rpc-stage-")
         .tempfile_in(root.join(INTERNAL))?;
@@ -417,6 +460,7 @@ pub(super) fn publish_playlist(
         metadata,
         published: Some(path.strip_prefix(root)?.to_path_buf()),
         modified: Some(stage.as_file().metadata()?.modified()?),
+        playlist_digest: Some(super::key(&local)),
         playlist: Some(PublishedPlaylist {
             canonical,
             original,
@@ -481,12 +525,15 @@ fn publish_slice(
         name.push_str(extension);
     }
     let path = base.with_file_name(name);
+    let size = span.end - span.start;
+    index.reserve(capacity, size).context(PublicationCapacity)?;
+    // The index remains locked through the write and commit.
+    index.reserved -= size;
     let mut stage = tempfile::Builder::new()
         .prefix(".rpc-stage-")
         .tempfile_in(root.join(INTERNAL))?;
     copy_ranges(&mut stage, &covering)?;
     stage.as_file().sync_data()?;
-    let size = span.end - span.start;
     drop(covering);
     let replaced: Vec<_> = index.entries[&key]
         .iter()
@@ -499,13 +546,6 @@ fn publish_slice(
         .cloned()
         .collect();
     let replaced_size: u64 = replaced.iter().map(|entry| entry.size()).sum();
-    let needed = size.saturating_sub(replaced_size);
-    if needed > 0 {
-        index
-            .reserve(capacity, needed)
-            .context("insufficient space for HLS range")?;
-        index.reserved -= needed;
-    }
     let record = Record {
         source: source.to_owned(),
         key: key.clone(),
@@ -514,6 +554,7 @@ fn publish_slice(
         published: Some(path.strip_prefix(root)?.to_path_buf()),
         modified: Some(stage.as_file().metadata()?.modified()?),
         playlist: None,
+        playlist_digest: None,
     };
     persist_published(root, index, stage, record, path)?;
     index.entries.get_mut(&key).unwrap().retain(|entry| {

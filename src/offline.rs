@@ -4,14 +4,14 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body_util::BodyExt;
 use serde::Serialize;
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 
 use crate::{
-    cache::{Cache, key},
+    cache::{Cache, DOWNLOAD_CACHE_FAILURE, DownloadCacheFailure, key, record_download_failure},
     hls::{self, Resource},
     playback::{Body, Playback, full},
 };
@@ -32,6 +32,9 @@ pub(crate) struct Progress {
     state: State,
     processed_bytes: u64,
     bandwidth: Option<u64>,
+    queued: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_code: Option<&'static str>,
 }
 
 struct Task {
@@ -40,13 +43,31 @@ struct Task {
     cancel: watch::Sender<bool>,
 }
 
-#[derive(Default)]
 pub(crate) struct Downloads {
+    slots: Arc<Semaphore>,
+    parallelism: usize,
+    queue_capacity: usize,
     tasks: Mutex<HashMap<String, Arc<Task>>>,
     variant_parents: Mutex<HashMap<String, String>>,
 }
 
+impl Default for Downloads {
+    fn default() -> Self {
+        Self::new(2, 16)
+    }
+}
+
 impl Downloads {
+    fn new(parallelism: usize, queue_capacity: usize) -> Self {
+        Self {
+            slots: Arc::new(Semaphore::new(parallelism)),
+            parallelism,
+            queue_capacity,
+            tasks: Mutex::default(),
+            variant_parents: Mutex::default(),
+        }
+    }
+
     pub(crate) fn note_playlist(&self, source: &str, canonical: &str) {
         if !hls::is_master(canonical) {
             return;
@@ -68,6 +89,23 @@ impl Downloads {
 }
 
 impl Playback {
+    pub fn with_download_limits(
+        mut self,
+        parallelism: usize,
+        queue_capacity: usize,
+    ) -> Result<Self> {
+        ensure!(
+            parallelism > 0 && parallelism <= Semaphore::MAX_PERMITS,
+            "invalid offline download parallelism"
+        );
+        ensure!(
+            parallelism.checked_add(queue_capacity).is_some(),
+            "invalid offline download queue capacity"
+        );
+        self.downloads = Downloads::new(parallelism, queue_capacity);
+        Ok(self)
+    }
+
     pub(crate) fn start_download(
         self: &Arc<Self>,
         source: &str,
@@ -95,10 +133,30 @@ impl Playback {
         if tasks.len() >= 256 {
             tasks.retain(|_, task| task.progress.lock().unwrap().state == State::Running);
         }
+        let active = tasks
+            .values()
+            .filter(|task| task.progress.lock().unwrap().state == State::Running)
+            .count();
+        if active >= self.downloads.parallelism + self.downloads.queue_capacity {
+            return Ok((
+                StatusCode::TOO_MANY_REQUESTS,
+                Progress {
+                    state: State::Failed,
+                    processed_bytes: 0,
+                    bandwidth,
+                    queued: false,
+                    error_code: Some("queue_full"),
+                },
+            ));
+        }
+        let slots = self.downloads.slots.clone();
+        let permit = slots.clone().try_acquire_owned().ok();
         let initial = Progress {
             state: State::Running,
             processed_bytes: 0,
             bandwidth,
+            queued: permit.is_none(),
+            error_code: None,
         };
         let (cancel, mut cancelled) = watch::channel(false);
         let task = Arc::new(Task {
@@ -110,21 +168,61 @@ impl Playback {
         let playback = self.clone();
         let source = source.to_owned();
         tokio::spawn(async move {
-            let mut pins = TaskPins::new(playback.cache.clone());
-            pins.pin(&source);
+            let cache_failure = Arc::new(Mutex::new(None));
             let result = tokio::select! {
                 biased;
                 _ = cancelled.wait_for(|value| *value) => Ok(State::Cancelled),
-                result = playback.run_download(&source, &task, &mut pins) => result,
+                result = async {
+                    let _permit = match permit {
+                        Some(permit) => permit,
+                        None => slots.acquire_owned().await?,
+                    };
+                    task.progress.lock().unwrap().queued = false;
+                    let mut pins = TaskPins::new(playback.cache.clone());
+                    pins.pin(&source);
+                    DOWNLOAD_CACHE_FAILURE
+                        .scope(Some(cache_failure.clone()), playback.run_download(&source, &task, &mut pins))
+                        .await
+                } => result,
             };
-            let state = match result {
-                Ok(state) => state,
+            let (state, error_code) = match result {
+                Ok(State::InsufficientCapacity) => match *cache_failure.lock().unwrap() {
+                    Some(DownloadCacheFailure::Capacity) => (State::InsufficientCapacity, None),
+                    Some(DownloadCacheFailure::Write) => {
+                        (State::Failed, Some("cache_write_failed"))
+                    }
+                    Some(DownloadCacheFailure::DiskFull) => (State::Failed, Some("disk_full")),
+                    Some(DownloadCacheFailure::Publish) | None => {
+                        (State::Failed, Some("publish_failed"))
+                    }
+                },
+                Ok(state) => (state, None),
                 Err(error) => {
                     tracing::debug!(error = %error, "offline download failed");
-                    State::Failed
+                    let code = if error.chain().any(|cause| {
+                        cause.is::<tokio::time::error::Elapsed>()
+                            || cause
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+                    }) {
+                        "origin_timeout"
+                    } else if error
+                        .downcast_ref::<crate::origin::OriginAddressDenied>()
+                        .is_some()
+                    {
+                        "origin_address_denied"
+                    } else if let Some(failure) = error.downcast_ref::<OriginFailure>() {
+                        failure.0
+                    } else {
+                        "download_failed"
+                    };
+                    (State::Failed, Some(code))
                 }
             };
-            task.progress.lock().unwrap().state = state;
+            let mut progress = task.progress.lock().unwrap();
+            progress.queued = false;
+            progress.state = state;
+            progress.error_code = error_code;
         });
         Ok((StatusCode::ACCEPTED, initial))
     }
@@ -190,7 +288,11 @@ impl Playback {
         };
         if !is_hls {
             let complete = self.transfer(source, None, None, task).await?;
-            return Ok(if complete {
+            if !complete {
+                // All ranges may already be present after a previous failed publication.
+                let _ = self.cache.retry_media_publication(source).await;
+            }
+            return Ok(if complete || self.cache.contains(source, None) {
                 State::Completed
             } else {
                 State::InsufficientCapacity
@@ -333,15 +435,15 @@ impl Playback {
                 .and_then(|value| value.parse::<u64>().ok())
                 .is_some_and(|length| length > self.cache.capacity())
         {
+            record_download_failure(DownloadCacheFailure::Capacity);
             return Ok(false);
         }
-        ensure!(
-            response.status().is_success(),
-            "origin returned {}",
-            response.status()
-        );
+        if !response.status().is_success() {
+            return Err(anyhow::Error::new(OriginFailure("origin_response"))
+                .context(format!("media response returned {}", response.status())));
+        }
         while let Some(frame) = response.body_mut().frame().await {
-            let frame = frame?;
+            let frame = frame.context(OriginFailure("origin_body_failed"))?;
             if let Some(data) = frame.data_ref() {
                 let mut progress = task.progress.lock().unwrap();
                 progress.processed_bytes =
@@ -376,9 +478,21 @@ impl Playback {
     async fn download_manifest(&self, source: &str) -> Result<String> {
         let origin = self.origin.fetch(source, Method::GET, None).await?;
         if !origin.status().is_success() {
-            bail!("playlist origin returned {}", origin.status());
+            return Err(anyhow::Error::new(OriginFailure("origin_response"))
+                .context(format!("playlist origin returned {}", origin.status())));
         }
         self.canonical_playlist(origin).await
+    }
+}
+
+#[derive(Debug)]
+struct OriginFailure(&'static str);
+
+impl std::error::Error for OriginFailure {}
+
+impl std::fmt::Display for OriginFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
     }
 }
 
