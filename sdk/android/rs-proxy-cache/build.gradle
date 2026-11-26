@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.library'
+}
+
+android {
+    namespace = 'cn.gavinliu.rsproxycache'
+    compileSdk = 36
+    ndkVersion = '28.2.13676358'
+    defaultConfig {
+        minSdk = 24
+        consumerProguardFiles 'consumer-rules.pro'
+    }
+}
+
+def repo = rootProject.layout.projectDirectory.dir('../..')
+def ndkOverride = providers.environmentVariable('ANDROID_NDK_HOME')
+def configuredNdk = androidComponents.sdkComponents.ndkDirectory.map { it.asFile.absolutePath }
+
+abstract class BuildProxyJni extends Exec {
+    @OutputDirectory
+    abstract DirectoryProperty getJniDirectory()
+}
+
+def buildProxyJni = tasks.register('buildProxyJni', BuildProxyJni) {
+    jniDirectory.set(layout.buildDirectory.dir('generated/proxyJni'))
+    inputs.files(repo.files('Cargo.toml', 'Cargo.lock'), repo.dir('src'),
+            layout.projectDirectory.files('bridge.c', 'build-native.sh'))
+    def ndkPath = ndkOverride.orElse(configuredNdk)
+    inputs.property('ndkPath', ndkPath)
+    inputs.property('ndkVersion', android.ndkVersion)
+    executable 'sh'
+    args layout.projectDirectory.file('build-native.sh').asFile
+    argumentProviders.add({ [jniDirectory.get().asFile.absolutePath, ndkPath.get()] } as CommandLineArgumentProvider)
+}
+
+androidComponents {
+    onVariants(selector().all()) { variant ->
+        variant.sources.jniLibs.addGeneratedSourceDirectory(buildProxyJni) { it.jniDirectory }
+    }
+}

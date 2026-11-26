@@ -1,0 +1,1 @@
+-keepclasseswithmembernames class cn.gavinliu.rsproxycache.ProxyCache { native <methods>; }

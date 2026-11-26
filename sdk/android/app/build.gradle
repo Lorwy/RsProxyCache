@@ -1,0 +1,21 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace = 'cn.gavinliu.rpcacceptance'
+    compileSdk = 36
+    defaultConfig {
+        applicationId = 'cn.gavinliu.rpcacceptance'
+        minSdk = 24
+        targetSdk = 36
+    }
+}
+
+dependencies {
+    compileOnly 'androidx.annotation:annotation:1.9.1'
+    implementation project(':rs-proxy-cache')
+    implementation 'androidx.media3:media3-exoplayer:1.8.0'
+    implementation 'androidx.media3:media3-exoplayer-hls:1.8.0'
+    implementation 'androidx.media3:media3-ui:1.8.0'
+}

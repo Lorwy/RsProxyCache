@@ -16,7 +16,8 @@ __pycache__/
 # macOS Finder metadata
 .DS_Store
 
-# Android acceptance project output
-/sdk/android/acceptance/.gradle/
-/sdk/android/acceptance/build/
-/sdk/android/acceptance/local.properties
+# Android Gradle project output
+/sdk/android/**/.gradle/
+/sdk/android/.idea/
+/sdk/android/**/build/
+/sdk/android/**/local.properties

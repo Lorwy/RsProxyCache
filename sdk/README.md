@@ -6,15 +6,23 @@
 
 ## Android
 
-用 Android NDK 28、JDK 和对应的 Rust Android targets 构建 AAR。
+在 Android Studio 打开 [sdk/android](android)。Gradle 根工程包含两个模块。
+
+- `:app` 是可直接运行的示例。输入 HTTP(S) MP4 或 HLS 点播地址，点击 **Play through proxy**。无 `.m3u8` 后缀时可勾选 **Force HLS**。跨域重定向或 HLS 资源跨域时，在 **Additional origin hosts** 中以逗号分隔填写额外主机名。
+- `:rs-proxy-cache` 是 Android library。示例通过 `implementation project(':rs-proxy-cache')` 直接依赖该模块。Gradle 构建时会编译 Rust 和 JNI，并将原生库打包到 APK 和 AAR。
+
+示例中的 **Browse cache files** 可打开 App 私有缓存目录，逐级浏览文件名和大小。点击 **Refresh** 可查看最新落盘结果。
+
+源码构建使用 macOS 或 Linux 上的 POSIX shell。首次构建需要 JDK 17 或更新版本、Android SDK 36、NDK `28.2.13676358`，以及 Rust 工具链。Gradle 默认使用 Android SDK 中配置的 NDK，也可用 `ANDROID_NDK_HOME` 指定 NDK 路径。以下命令从仓库根目录执行。
 
 ```sh
-sh sdk/android/build.sh
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
+sdk/android/gradlew -p sdk/android :app:assembleDebug :rs-proxy-cache:assembleRelease
 ```
 
-构建脚本读取 `ANDROID_NDK_HOME`。产物位于 `target/sdk/rs-proxy-cache.aar`，包含 arm64-v8a、armeabi-v7a、x86_64 和 x86。最低版本为 API 24。HTTPS 回源使用随组件打包的 WebPKI 公共根证书。
+示例 APK 位于 `sdk/android/app/build/outputs/apk/debug/app-debug.apk`。AAR 位于 `sdk/android/rs-proxy-cache/build/outputs/aar/rs-proxy-cache-release.aar`，支持 arm64-v8a、armeabi-v7a、x86_64 和 x86，最低版本为 API 24。也可以执行 `sh sdk/android/build.sh`，将 release AAR 导出到 `target/sdk/rs-proxy-cache.aar`。HTTPS 回源使用随组件打包的 WebPKI 公共根证书。
 
-将 AAR 加入宿主依赖，并在宿主的 Android 网络安全配置中允许播放器对 `127.0.0.1` 发起明文 HTTP 请求。AAR 声明了 `INTERNET` 权限。可参考 [验收 App 的网络配置](android/acceptance/src/main/res/xml/network_security_config.xml)。
+将 AAR 加入宿主依赖，并在宿主的 Android 网络安全配置中允许播放器对 `127.0.0.1` 发起明文 HTTP 请求。AAR 声明了 `INTERNET` 权限。可参考 [示例 App 的网络配置](android/app/src/main/res/xml/network_security_config.xml)。
 
 ```kotlin
 import androidx.media3.common.MediaItem
@@ -38,7 +46,7 @@ Media3 播放 HLS 需要加入与播放器版本一致的 `media3-exoplayer-hls`
 
 ### Media3 验收
 
-`sdk/android/acceptance` 是使用该 AAR 的独立验收 App。用 Gradle 9.3.1 和 Android SDK 36 构建 `assembleDebug`，安装 APK，再通过 `PlaybackActivity` 的 `source` Intent 参数传入支持 Range 的 HTTPS MP4。验收 App 会起播并跳到中间位置，可观察 `RpcAcceptance` 日志。切到后台并返回验证恢复。传入 `--ez warm true` 可在起播前通过代理完整读取视频，测试视频需小于配置的缓存容量。确认落盘后断开模拟器外网、强制停止验收 App，再用同一源地址重新启动。重启时省略 `warm` 参数，观察播放器能否从缓存起播并跳转。
+示例 App 的 debug 版本包含独立的自动验收入口。安装 debug APK 后，运行 `adb shell am start -n cn.gavinliu.rpcacceptance/.PlaybackActivity --es source <URL>`，传入支持 Range 的 HTTPS MP4。验收 App 会起播并跳到中间位置，可观察 `RpcAcceptance` 日志。切到后台并返回验证恢复。传入 `--ez warm true` 可在起播前通过代理完整读取视频，测试视频需小于配置的缓存容量。确认落盘后断开模拟器外网、强制停止验收 App，再用同一源地址重新启动。重启时省略 `warm` 参数，观察播放器能否从缓存起播并跳转。
 
 HLS 使用相同的 `source` 参数。可加 `--ez hls true` 显式设置 Media3 的媒体类型，并加 `--ez verifyTracks true` 在跳转成功后切换到可用的其他视频、音轨和字幕轨道，通过 `EventLogger` 检查实际加载的格式。验收已发布的明文 HLS 时，断网重启 App，使用同一个源地址生成新的代理播放地址。AES-128 HLS 的播放列表和密钥仍需回源。
 
