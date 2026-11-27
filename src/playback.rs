@@ -292,7 +292,7 @@ impl Playback {
                     Prepared::Failure(response) => return Ok(response),
                     Prepared::Retry => {}
                 }
-            } else {
+            } else if matches!(requested, Requested::Suffix(0)) {
                 return unsatisfiable(metadata.size);
             }
         }

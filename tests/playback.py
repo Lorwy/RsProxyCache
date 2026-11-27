@@ -844,7 +844,7 @@ unsized.ts
         self.start()
         self.assertEqual(self.get("80-99")[2], self.origin.data[80:100])
         self.assertEqual(len(self.origin.requests), 1)
-        status, headers, _ = self.get("200-209")
+        status, headers, _ = self.get("-0")
         self.assertEqual((status, headers["Content-Range"]), (416, "bytes */200"))
         self.assertEqual(len(self.origin.requests), 1)
         self.assertEqual(self.get("75-90")[0], 403)
@@ -854,6 +854,23 @@ unsized.ts
                        env={**os.environ, "RPC_CACHE_DIR": str(self.cache)})
         self.start()
         self.assertEqual(self.get("80-99")[0], 403)
+
+    def test_out_of_range_seek_revalidates_extended_replacement(self):
+        self.start()
+        self.assertEqual(self.get("0-99")[0], 206)
+        self.stop()
+        self.origin.data = bytes(range(240))
+        self.origin.etag = '"two"'
+        self.start()
+        status, headers, body = self.get("200-239")
+        self.assertEqual(
+            (status, headers["Content-Range"], body),
+            (206, "bytes 200-239/240", self.origin.data[200:240]),
+        )
+        self.assertEqual(self.origin.requests[-1], ("GET", SIGNED_PATH, "bytes=200-239"))
+        previous = len(self.origin.requests)
+        self.assertEqual(self.get("200-239")[2], self.origin.data[200:240])
+        self.assertEqual(len(self.origin.requests), previous)
 
     def test_deleted_interval_is_refilled_and_hits_again(self):
         self.start(log_level="debug")
