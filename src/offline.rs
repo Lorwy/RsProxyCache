@@ -426,6 +426,35 @@ impl Playback {
         span: Option<Range<u64>>,
         task: &Task,
     ) -> Result<bool> {
+        let mut attempts = 0;
+        loop {
+            if self
+                .transfer_once(source, resource, span.clone(), task)
+                .await?
+            {
+                return Ok(true);
+            }
+            if span.is_some() || attempts >= 2 {
+                return Ok(false);
+            }
+            attempts += 1;
+            // A whole-file request may follow an in-flight cache write instead
+            // of staging its own copy. Wait for that write to settle; if the
+            // writer failed or its player disconnected, take over the write.
+            self.wait_whole(&key(source)).await;
+            if self.cache.contains(source, None) {
+                return Ok(true);
+            }
+        }
+    }
+
+    async fn transfer_once(
+        self: &Arc<Self>,
+        source: &str,
+        resource: Option<Resource>,
+        span: Option<Range<u64>>,
+        task: &Task,
+    ) -> Result<bool> {
         let mut response = self
             .offline_fetch(source, resource, Method::GET, span.as_ref())
             .await?;

@@ -454,6 +454,95 @@ class PlaybackTests(unittest.TestCase):
         published = self.cache / "127.0.0.1" / "whole-version" / "movie.mp4"
         self.assertEqual(published.read_bytes(), new)
 
+    def test_offline_takes_over_after_player_disconnects_mid_whole_playback(self):
+        data = b"T" * (16 * 1024 * 1024)
+        self.start(capacity=len(data))
+        self.origin.ignore_range = True
+        self.origin.data = data
+        source = "/takeover/movie.mp4"
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def player():
+            try:
+                with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)) as conn:
+                    conn.request("GET", "/v1/" + self.source + source)
+                    with conn.getresponse() as response:
+                        self.assertEqual(response.status, 200)
+                        response.read(1)
+                        started.set()
+                        release.wait(30)
+                        # Disconnect abruptly; the staged whole write is abandoned.
+            except Exception as error:
+                errors.append(error)
+                started.set()
+
+        thread = threading.Thread(target=player)
+        thread.start()
+        path = "/v1/offline/" + self.source + source
+        try:
+            self.assertTrue(started.wait(5))
+            self.assertEqual(self.get(method="POST", proxy_path=path)[0], 202)
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                task = json.loads(self.get(proxy_path=path)[2])
+                self.assertEqual(task["state"], "running")
+                time.sleep(0.05)
+        finally:
+            release.set()
+            thread.join(30)
+        self.assertEqual(errors, [])
+        deadline = time.monotonic() + 20
+        while True:
+            task = json.loads(self.get(proxy_path=path)[2])
+            if task["state"] != "running":
+                break
+            self.assertLess(time.monotonic(), deadline, task)
+            time.sleep(0.05)
+        self.assertEqual(task["state"], "completed")
+        published = self.cache / "127.0.0.1" / "takeover" / "movie.mp4"
+        self.assertEqual(published.read_bytes(), data)
+
+    def test_new_etag_reclaims_capacity_held_by_stale_whole_writer(self):
+        old = b"A" * (16 * 1024 * 1024)
+        new = b"B" * (16 * 1024 * 1024)
+        self.start(capacity=len(old))
+        self.origin.ignore_range = True
+        self.origin.data = old
+        source = "/stale-capacity/movie.mp4"
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def player():
+            try:
+                with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)) as conn:
+                    conn.request("GET", "/v1/" + self.source + source)
+                    with conn.getresponse() as response:
+                        self.assertEqual(response.status, 200)
+                        response.read(1)
+                        started.set()
+                        release.wait(30)
+                        self.assertEqual(len(response.read()), len(old) - 1)
+            except Exception as error:
+                errors.append(error)
+                started.set()
+
+        thread = threading.Thread(target=player)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(5))
+            self.origin.data = new
+            self.origin.etag = '"two"'
+            self.assertEqual(self.await_offline_task(source, timeout=20)["state"], "completed")
+        finally:
+            release.set()
+            thread.join(30)
+        self.assertEqual(errors, [])
+        published = self.cache / "127.0.0.1" / "stale-capacity" / "movie.mp4"
+        self.assertEqual(published.read_bytes(), new)
+
     def test_offline_reports_capacity_write_and_publication_failures(self):
         self.start(capacity=400)
 

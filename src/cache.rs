@@ -206,6 +206,10 @@ struct Index {
     entries: HashMap<String, Vec<Arc<Entry>>>,
     size: u64,
     reserved: u64,
+    /// Staged bytes still held by in-flight writers, per version id, so quota
+    /// owned by a retired representation can be reclaimed without waiting for
+    /// its (possibly paused) writer to drop.
+    reservations: HashMap<u64, (String, u64)>,
     versions: HashMap<String, Weak<CacheVersion>>,
     next_version: u64,
     retired: Vec<(Weak<Entry>, u64)>,
@@ -220,13 +224,14 @@ struct Reservation {
     cache: Arc<Cache>,
     size: u64,
     generation: u64,
+    version: u64,
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
         let mut index = self.cache.index.lock().unwrap();
         if self.generation == index.generation {
-            index.reserved -= self.size;
+            index.release_reservation(self.version, self.size);
         }
     }
 }
@@ -559,14 +564,17 @@ impl Cache {
         if !self.refresh_index(&mut index) || !index.is_current(version) {
             return None;
         }
-        index.reserve(self.capacity, size).or_else(|| {
-            record_download_failure(DownloadCacheFailure::Capacity);
-            None
-        })?;
+        index
+            .reserve(self.capacity, size, Some(version))
+            .or_else(|| {
+                record_download_failure(DownloadCacheFailure::Capacity);
+                None
+            })?;
         Some(Reservation {
             cache: self.clone(),
             size,
             generation: index.generation,
+            version: version.id,
         })
     }
 
@@ -600,6 +608,7 @@ impl Cache {
             cache: self.clone(),
             size: 0,
             generation,
+            version: version.id,
         };
         Some(WholeWriter {
             source,
@@ -681,6 +690,38 @@ impl Cache {
         Some(index.set_version(source, metadata))
     }
 
+    /// Record the received size of an unknown-length whole response and adopt
+    /// the corrected representation in a single index lock, verifying the
+    /// expected version is still current. A newer representation adopted while
+    /// the download was in flight must never be retired by this late finish.
+    pub(crate) fn adopt_received_size(
+        &self,
+        source: &str,
+        expected: &CacheVersion,
+        size: u64,
+        generation: u64,
+    ) -> Option<Arc<CacheVersion>> {
+        let key = key(source);
+        let mut index = self.index.lock().unwrap();
+        if !self.refresh_index(&mut index)
+            || index.generation != generation
+            || !index.is_current(expected)
+        {
+            return None;
+        }
+        let mut metadata = expected.metadata.clone();
+        metadata.size = size;
+        if index
+            .entries
+            .get(&key)
+            .and_then(|entries| entries.last())
+            .is_some_and(|entry| entry.record.metadata != metadata)
+        {
+            index.clear(&key);
+        }
+        Some(index.set_version(source, metadata))
+    }
+
     pub fn version_for_patch(&self, key: &str, metadata: &Metadata) -> Option<Arc<CacheVersion>> {
         let mut index = self.index.lock().unwrap();
         if let Some(active) = index.active(key) {
@@ -739,7 +780,7 @@ impl Reservation {
                     .inspect_err(|error| {
                         record_io_failure(error.downcast_ref(), DownloadCacheFailure::Publish)
                     })?;
-                index.reserved -= self.size;
+                index.release_reservation(version.id, self.size);
                 self.size = 0;
                 index.publish_playlists(&self.cache.dir, self.cache.capacity);
             }
@@ -760,7 +801,7 @@ impl Reservation {
             remove(&path);
             return Err(error.into());
         }
-        index.reserved -= self.size;
+        index.release_reservation(version.id, self.size);
         self.size = 0;
         tracing::debug!(
             start = record.span.start,
@@ -1003,14 +1044,49 @@ impl Index {
             .push(Arc::new(entry));
     }
 
-    fn reserve(&mut self, capacity: u64, size: u64) -> Option<()> {
+    fn reserve(&mut self, capacity: u64, size: u64, version: Option<&CacheVersion>) -> Option<()> {
+        self.release_stale_reservations();
         let remaining = capacity.checked_sub(size.checked_add(self.reserved)?)?;
         self.evict(remaining);
         if self.size > remaining {
             return None;
         }
         self.reserved += size;
+        if let Some(version) = version {
+            let tracked = self
+                .reservations
+                .entry(version.id)
+                .or_insert_with(|| (version.key.clone(), 0));
+            tracked.1 += size;
+        }
         Some(())
+    }
+
+    /// Return quota still held by writers whose representation has been
+    /// retired, so a paused or abandoned old writer cannot starve a newer one.
+    fn release_stale_reservations(&mut self) {
+        let stale: Vec<u64> = self
+            .reservations
+            .iter()
+            .filter(|(id, (key, _))| self.active(key).is_none_or(|active| active.id != **id))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stale {
+            if let Some((_, size)) = self.reservations.remove(&id) {
+                self.reserved -= size;
+            }
+        }
+    }
+
+    fn release_reservation(&mut self, version: u64, size: u64) {
+        if let Some((_, tracked)) = self.reservations.get_mut(&version) {
+            let released = size.min(*tracked);
+            *tracked -= released;
+            self.reserved -= released;
+            if *tracked == 0 {
+                self.reservations.remove(&version);
+            }
+        }
     }
 
     fn reap_retired(&mut self) {
@@ -1212,6 +1288,11 @@ impl IntervalWriter {
     }
 }
 
+/// Test seam: lets a regression inject a newer representation at the exact
+/// point where an unknown-length whole finish corrects its recorded size.
+#[cfg(test)]
+pub(crate) static WHOLE_FINISH_RACE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
 pub(crate) struct WholeWriter {
     source: String,
     version: Arc<CacheVersion>,
@@ -1231,7 +1312,7 @@ impl WholeWriter {
                 return None;
             }
             index
-                .reserve(cache.capacity, bytes.len() as u64)
+                .reserve(cache.capacity, bytes.len() as u64, Some(&self.version))
                 .or_else(|| {
                     record_download_failure(DownloadCacheFailure::Capacity);
                     None
@@ -1261,13 +1342,16 @@ impl WholeWriter {
         let mut version = self.version.clone();
         if version.metadata.size != received {
             // The origin omitted Content-Length; record the received size only
-            // while this representation is still the current one.
-            if !cache.is_current(&version) {
-                return;
+            // while this representation is still the current one. The check and
+            // the size adoption share one index lock so a newer version adopted
+            // in between cannot be retired by this late finish.
+            #[cfg(test)]
+            if let Some(race) = WHOLE_FINISH_RACE.lock().unwrap().take() {
+                race();
             }
-            let mut metadata = version.metadata.clone();
-            metadata.size = received;
-            let Some(updated) = cache.adopt(&self.source, metadata, generation) else {
+            let Some(updated) =
+                cache.adopt_received_size(&self.source, &version, received, generation)
+            else {
                 return;
             };
             version = updated;
@@ -1730,5 +1814,79 @@ mod tests {
         store(&cache, &replacement, 0..20).await;
         assert!(matches!(cache.plan(&key(SOURCE), 0..20, &new).as_slice(),
                          [Piece::Cached(_, span)] if *span == (0..20)));
+    }
+
+    fn store_sync(cache: &Arc<Cache>, version: &Arc<CacheVersion>, span: Range<u64>) {
+        let bytes: Vec<u8> = span.clone().map(|offset| offset as u8).collect();
+        let reservation = cache.reserve(span.end - span.start, version).unwrap();
+        let stage = cache.stage_file().unwrap();
+        stage.as_file().write_all(&bytes).unwrap();
+        reservation.commit(stage, span, version.clone()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn reserving_reclaims_quota_held_by_a_retired_whole_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 100).unwrap();
+        let generation = cache.refresh();
+        let mut old = metadata(Some("\"v1\""));
+        old.size = 100;
+        let old_version = cache.adopt(SOURCE, old.clone(), generation).unwrap();
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), old.clone(), Some(100), generation)
+            .unwrap();
+        whole.write(&[1; 100]).await.unwrap();
+        assert_eq!(cache.index.lock().unwrap().reserved, 100);
+
+        // A newer representation retires the old writer, which stays paused and
+        // keeps holding its staged quota. A new reserve must reclaim it.
+        let new = metadata(Some("\"v2\""));
+        let new_version = cache.adopt(SOURCE, new.clone(), generation).unwrap();
+        let reservation = cache.reserve(100, &new_version);
+        assert!(
+            reservation.is_some(),
+            "stale writer must not starve the new version"
+        );
+        assert_eq!(cache.index.lock().unwrap().reserved, 100);
+
+        // Dropping the retired writer must not release the quota twice.
+        drop(whole);
+        assert_eq!(cache.index.lock().unwrap().reserved, 100);
+        drop(reservation);
+        assert_eq!(cache.index.lock().unwrap().reserved, 0);
+        let _ = old_version;
+    }
+
+    #[tokio::test]
+    async fn unknown_length_finish_does_not_retire_a_newer_published_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 4096).unwrap();
+        let generation = cache.refresh();
+        let mut old = metadata(Some("\"v1\""));
+        old.size = 0; // origin omitted Content-Length
+        let old_version = cache.adopt(SOURCE, old.clone(), generation).unwrap();
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), old.clone(), None, generation)
+            .unwrap();
+        whole.write(&[7; 100]).await.unwrap();
+
+        // Inject a newer representation that is adopted and published at the
+        // exact point where the old finish corrects its recorded size.
+        let racer = cache.clone();
+        let new = metadata(Some("\"v2\""));
+        *WHOLE_FINISH_RACE.lock().unwrap() = Some(Box::new(move || {
+            let version = racer.adopt(SOURCE, new.clone(), generation).unwrap();
+            store_sync(&racer, &version, 0..100);
+        }));
+        whole.finish().await;
+
+        assert!(cache.contains(SOURCE, None));
+        assert_eq!(
+            cache.metadata(&key(SOURCE)).unwrap().etag.as_deref(),
+            Some("\"v2\"")
+        );
+        let _ = old_version;
+        let published = directory.path().join("example.test/video.mp4");
+        assert_eq!(fs::read(published).unwrap(), (0..100).collect::<Vec<u8>>());
     }
 }
