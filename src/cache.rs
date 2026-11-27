@@ -593,6 +593,9 @@ impl Cache {
             })
             .ok()?;
         drop(index);
+        // Adopt at header time so a later finish cannot retire a newer
+        // representation adopted while this download was still in flight.
+        let version = self.adopt(&source, metadata, generation)?;
         let reservation = Reservation {
             cache: self.clone(),
             size: 0,
@@ -600,7 +603,7 @@ impl Cache {
         };
         Some(WholeWriter {
             source,
-            metadata,
+            version,
             data: StagedInterval::open(reservation, stage, 0..0).ok()?,
         })
     }
@@ -1211,7 +1214,7 @@ impl IntervalWriter {
 
 pub(crate) struct WholeWriter {
     source: String,
-    metadata: Metadata,
+    version: Arc<CacheVersion>,
     data: StagedInterval,
 }
 
@@ -1221,7 +1224,10 @@ impl WholeWriter {
         let cache = &reservation.cache;
         {
             let mut index = cache.index.lock().unwrap();
-            if !cache.refresh_index(&mut index) || reservation.generation != index.generation {
+            if !cache.refresh_index(&mut index)
+                || reservation.generation != index.generation
+                || !index.is_current(&self.version)
+            {
                 return None;
             }
             index
@@ -1245,15 +1251,28 @@ impl WholeWriter {
         Some(())
     }
 
-    pub(crate) async fn finish(mut self) {
-        let reservation = &self.data.reservation;
-        self.metadata.size = reservation.size;
-        if self.metadata.size > 0
-            && let Some(version) =
-                reservation
-                    .cache
-                    .adopt(&self.source, self.metadata, reservation.generation)
-        {
+    pub(crate) async fn finish(self) {
+        let received = self.data.reservation.size;
+        if received == 0 {
+            return;
+        }
+        let cache = self.data.reservation.cache.clone();
+        let generation = self.data.reservation.generation;
+        let mut version = self.version.clone();
+        if version.metadata.size != received {
+            // The origin omitted Content-Length; record the received size only
+            // while this representation is still the current one.
+            if !cache.is_current(&version) {
+                return;
+            }
+            let mut metadata = version.metadata.clone();
+            metadata.size = received;
+            let Some(updated) = cache.adopt(&self.source, metadata, generation) else {
+                return;
+            };
+            version = updated;
+        }
+        if cache.is_current(&version) {
             self.data.commit(version).await;
         }
     }

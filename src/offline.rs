@@ -289,6 +289,8 @@ impl Playback {
         if !is_hls {
             let complete = self.transfer(source, None, None, task).await?;
             if !complete {
+                // A concurrent request may still be writing the whole file.
+                self.wait_whole(&key(source)).await;
                 // All ranges may already be present after a previous failed publication.
                 let _ = self.cache.retry_media_publication(source).await;
             }
