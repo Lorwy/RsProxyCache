@@ -831,8 +831,14 @@ async fn send_remote(
         }
     };
     if disconnected {
-        if let Some(BodyWriter::Interval(writer)) = writer {
-            writer.finish_interrupted().await;
+        // The declared length is already verified, so the player leaving early
+        // must not discard a fully received interval or media file.
+        let complete = length == Some(received);
+        match writer {
+            Some(BodyWriter::Interval(writer)) if complete => writer.finish().await,
+            Some(BodyWriter::Interval(writer)) => writer.finish_interrupted().await,
+            Some(BodyWriter::Whole(writer)) if complete => writer.finish().await,
+            _ => {}
         }
         return Ok(());
     }
