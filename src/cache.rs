@@ -719,7 +719,19 @@ impl Cache {
         {
             index.clear(&key);
         }
-        Some(index.set_version(source, metadata))
+        let updated = index.set_version(source, metadata);
+        // The same writer keeps staging the same bytes under the corrected
+        // version id. Migrate its quota in this lock so the window before
+        // commit neither looks stale (another reserve reclaiming live quota)
+        // nor leaks at commit (which releases by the adopted id).
+        if let Some((staged_key, size)) = index.reservations.remove(&expected.id) {
+            index
+                .reservations
+                .entry(updated.id)
+                .or_insert_with(|| (staged_key, 0))
+                .1 += size;
+        }
+        Some(updated)
     }
 
     pub fn version_for_patch(&self, key: &str, metadata: &Metadata) -> Option<Arc<CacheVersion>> {
@@ -1293,6 +1305,11 @@ impl IntervalWriter {
 #[cfg(test)]
 pub(crate) static WHOLE_FINISH_RACE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
+/// Test seam: lets a regression race a second reservation into the window
+/// between the size correction and the commit of an unknown-length whole file.
+#[cfg(test)]
+pub(crate) static WHOLE_COMMIT_RACE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
+
 pub(crate) struct WholeWriter {
     source: String,
     version: Arc<CacheVersion>,
@@ -1332,7 +1349,7 @@ impl WholeWriter {
         Some(())
     }
 
-    pub(crate) async fn finish(self) {
+    pub(crate) async fn finish(mut self) {
         let received = self.data.reservation.size;
         if received == 0 {
             return;
@@ -1355,6 +1372,14 @@ impl WholeWriter {
                 return;
             };
             version = updated;
+            // The quota moved to the corrected id inside adopt_received_size;
+            // keep the reservation identity in sync so a failed or skipped
+            // commit still releases it on drop.
+            self.data.reservation.version = version.id;
+            #[cfg(test)]
+            if let Some(race) = WHOLE_COMMIT_RACE.lock().unwrap().take() {
+                race();
+            }
         }
         if cache.is_current(&version) {
             self.data.commit(version).await;
@@ -1888,5 +1913,68 @@ mod tests {
         let _ = old_version;
         let published = directory.path().join("example.test/video.mp4");
         assert_eq!(fs::read(published).unwrap(), (0..100).collect::<Vec<u8>>());
+    }
+
+    #[tokio::test]
+    async fn unknown_length_publish_releases_its_staged_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 100).unwrap();
+        let generation = cache.refresh();
+        let mut unknown = metadata(Some("\"v1\""));
+        unknown.size = 0; // origin omitted Content-Length
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, generation)
+            .unwrap();
+        whole.write(&[7; 100]).await.unwrap();
+        whole.finish().await;
+
+        assert!(cache.contains(SOURCE, None));
+        let index = cache.index.lock().unwrap();
+        assert_eq!(
+            index.reserved, 0,
+            "publishing must release the staged quota without waiting for the next reserve"
+        );
+        assert!(index.reservations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reserving_between_size_correction_and_commit_keeps_staged_quota() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::open(directory.path().to_owned(), 100).unwrap();
+        let generation = cache.refresh();
+        let mut unknown = metadata(Some("\"v1\""));
+        unknown.size = 0; // origin omitted Content-Length
+        let mut whole = cache
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, generation)
+            .unwrap();
+        whole.write(&[7; 100]).await.unwrap();
+
+        // A second resource tries to reserve the full capacity in the window
+        // between the size correction (which adopts a new version id) and the
+        // commit. The staged bytes are still in use and must not be reclaimed
+        // as stale, or the cache would exceed its configured capacity.
+        let other_source = "https://example.test/other.mp4";
+        let mut other_metadata = metadata(Some("\"o1\""));
+        other_metadata.target = key(other_source);
+        let other_version = cache
+            .adopt(other_source, other_metadata, generation)
+            .unwrap();
+        let racer = cache.clone();
+        let outcome = Arc::new(Mutex::new(None));
+        let raced = outcome.clone();
+        *WHOLE_COMMIT_RACE.lock().unwrap() = Some(Box::new(move || {
+            *raced.lock().unwrap() = Some(racer.reserve(100, &other_version).is_some());
+        }));
+        whole.finish().await;
+
+        assert_eq!(
+            *outcome.lock().unwrap(),
+            Some(false),
+            "in-flight staged quota must not be reclaimed as stale"
+        );
+        assert!(cache.contains(SOURCE, None));
+        let index = cache.index.lock().unwrap();
+        assert_eq!(index.reserved, 0);
+        assert!(index.size <= cache.capacity());
     }
 }
