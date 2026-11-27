@@ -468,7 +468,10 @@ impl Playback {
             Some(key) => crate::mobile::sign(key, &target),
             None => target,
         };
-        let mut request = Request::builder().uri(format!("/v1/{path}")).method(method);
+        let mut request = Request::builder()
+            .uri(format!("/v1/{path}"))
+            .method(method)
+            .extension(crate::playback::OfflineFetch);
         if let Some(span) = span {
             request = request.header(header::RANGE, crate::range::upstream(span));
         }

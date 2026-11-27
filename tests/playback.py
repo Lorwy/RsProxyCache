@@ -323,6 +323,48 @@ class PlaybackTests(unittest.TestCase):
         published = self.cache / "127.0.0.1" / "download" / "movie.mp4"
         self.assertEqual(published.read_bytes(), self.origin.data)
 
+    def test_offline_download_completes_while_same_url_is_playing(self):
+        self.start(capacity=64 * 1024 * 1024)
+        self.origin.data = b"P" * (16 * 1024 * 1024)
+        source = "/concurrent/movie.mp4"
+        started = threading.Event()
+        release = threading.Event()
+        errors = []
+
+        def player():
+            try:
+                with contextlib.closing(http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)) as conn:
+                    conn.request("GET", "/v1/" + self.source + source)
+                    with conn.getresponse() as response:
+                        self.assertEqual(response.status, 200)
+                        response.read(1)
+                        started.set()
+                        release.wait(30)
+                        self.assertEqual(len(response.read()), len(self.origin.data) - 1)
+            except Exception as error:
+                errors.append(error)
+                started.set()
+
+        thread = threading.Thread(target=player)
+        thread.start()
+        try:
+            self.assertTrue(started.wait(5))
+            self.assertEqual(self.await_offline_task(source, timeout=20)["state"], "completed")
+        finally:
+            release.set()
+            thread.join(10)
+        self.assertEqual(errors, [])
+        published = self.cache / "127.0.0.1" / "concurrent" / "movie.mp4"
+        self.assertEqual(published.read_bytes(), self.origin.data)
+
+    def test_offline_download_caches_octet_stream_media(self):
+        self.start()
+        self.origin.ignore_range = True
+        self.origin.resources["/media/clip.mkv"] = ("application/octet-stream", self.origin.data)
+        self.assertEqual(self.await_offline_task("/media/clip.mkv")["state"], "completed")
+        published = self.cache / "127.0.0.1" / "media" / "clip.mkv"
+        self.assertEqual(published.read_bytes(), self.origin.data)
+
     def test_offline_reports_capacity_write_and_publication_failures(self):
         self.start(capacity=400)
 

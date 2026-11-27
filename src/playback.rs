@@ -35,6 +35,12 @@ use crate::{
 pub(crate) type Body = UnsyncBoxBody<Bytes, io::Error>;
 type Sender = mpsc::Sender<io::Result<Frame<Bytes>>>;
 
+/// Marks an internal offline-download request. Such requests must always write
+/// to the cache and never contend for the player-oriented request lock, so a
+/// concurrent playback stream cannot turn a download into a cache bypass.
+#[derive(Clone)]
+pub(crate) struct OfflineFetch;
+
 pub struct Playback {
     pub(crate) downloads: crate::offline::Downloads,
     recent_variants: Mutex<HashMap<String, String>>,
@@ -243,7 +249,8 @@ impl Playback {
         tracing::Span::current().record("cache_key", &key);
         tracing::debug!(range = %requested.upstream(), "playback request");
 
-        let guard = if head {
+        let offline = request.extensions().get::<OfflineFetch>().is_some();
+        let guard = if head || offline {
             None
         } else {
             let lock_key = format!("{key}:{}", requested.upstream());
@@ -255,7 +262,7 @@ impl Playback {
         };
         // A player may open a new connection before draining an earlier response.
         // After a bounded wait, relay a fresh response without competing for its cache writes.
-        let bypass_cache = !head && guard.is_none();
+        let bypass_cache = !head && !offline && guard.is_none();
         let generation = self.cache.refresh();
         let previous = self.cache.metadata(&key);
         if head {
@@ -349,7 +356,8 @@ impl Playback {
                 let headers = origin.headers().clone();
                 let length = content_length(&headers)?;
                 let part = if !bypass_cache
-                    && (resource == Some(Resource::Media)
+                    && (offline
+                        || resource == Some(Resource::Media)
                         || uri
                             .path()
                             .as_bytes()
