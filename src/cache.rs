@@ -199,6 +199,14 @@ pub struct Cache {
     dir: PathBuf,
     capacity: u64,
     index: Mutex<Index>,
+    /// Test seams, per instance so parallel tests on different caches never
+    /// consume each other's hooks. They fire where an unknown-length whole
+    /// finish corrects its recorded size (finish) and between that correction
+    /// and the commit (commit).
+    #[cfg(test)]
+    whole_finish_race: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    whole_commit_race: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Default)]
@@ -260,6 +268,10 @@ impl Cache {
             dir,
             capacity,
             index: Mutex::new(index),
+            #[cfg(test)]
+            whole_finish_race: Mutex::new(None),
+            #[cfg(test)]
+            whole_commit_race: Mutex::new(None),
         })
     }
 
@@ -1300,16 +1312,6 @@ impl IntervalWriter {
     }
 }
 
-/// Test seam: lets a regression inject a newer representation at the exact
-/// point where an unknown-length whole finish corrects its recorded size.
-#[cfg(test)]
-pub(crate) static WHOLE_FINISH_RACE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
-
-/// Test seam: lets a regression race a second reservation into the window
-/// between the size correction and the commit of an unknown-length whole file.
-#[cfg(test)]
-pub(crate) static WHOLE_COMMIT_RACE: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
-
 pub(crate) struct WholeWriter {
     source: String,
     version: Arc<CacheVersion>,
@@ -1363,7 +1365,7 @@ impl WholeWriter {
             // the size adoption share one index lock so a newer version adopted
             // in between cannot be retired by this late finish.
             #[cfg(test)]
-            if let Some(race) = WHOLE_FINISH_RACE.lock().unwrap().take() {
+            if let Some(race) = cache.whole_finish_race.lock().unwrap().take() {
                 race();
             }
             let Some(updated) =
@@ -1377,7 +1379,7 @@ impl WholeWriter {
             // commit still releases it on drop.
             self.data.reservation.version = version.id;
             #[cfg(test)]
-            if let Some(race) = WHOLE_COMMIT_RACE.lock().unwrap().take() {
+            if let Some(race) = cache.whole_commit_race.lock().unwrap().take() {
                 race();
             }
         }
@@ -1899,7 +1901,7 @@ mod tests {
         // exact point where the old finish corrects its recorded size.
         let racer = cache.clone();
         let new = metadata(Some("\"v2\""));
-        *WHOLE_FINISH_RACE.lock().unwrap() = Some(Box::new(move || {
+        *cache.whole_finish_race.lock().unwrap() = Some(Box::new(move || {
             let version = racer.adopt(SOURCE, new.clone(), generation).unwrap();
             store_sync(&racer, &version, 0..100);
         }));
@@ -1962,7 +1964,7 @@ mod tests {
         let racer = cache.clone();
         let outcome = Arc::new(Mutex::new(None));
         let raced = outcome.clone();
-        *WHOLE_COMMIT_RACE.lock().unwrap() = Some(Box::new(move || {
+        *cache.whole_commit_race.lock().unwrap() = Some(Box::new(move || {
             *raced.lock().unwrap() = Some(racer.reserve(100, &other_version).is_some());
         }));
         whole.finish().await;
@@ -1976,5 +1978,56 @@ mod tests {
         let index = cache.index.lock().unwrap();
         assert_eq!(index.reserved, 0);
         assert!(index.size <= cache.capacity());
+    }
+
+    #[tokio::test]
+    async fn whole_finish_hooks_are_isolated_per_cache_instance() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let a = Cache::open(dir_a.path().to_owned(), 100).unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let b = Cache::open(dir_b.path().to_owned(), 100).unwrap();
+        let gen_a = a.refresh();
+        let gen_b = b.refresh();
+        let mut unknown = metadata(Some("\"v1\""));
+        unknown.size = 0; // origin omitted Content-Length
+
+        // Arm both hooks for b's writer only.
+        let finish_fired = Arc::new(Mutex::new(false));
+        let commit_fired = Arc::new(Mutex::new(false));
+        let flag = finish_fired.clone();
+        *b.whole_finish_race.lock().unwrap() = Some(Box::new(move || {
+            *flag.lock().unwrap() = true;
+        }));
+        let flag = commit_fired.clone();
+        *b.whole_commit_race.lock().unwrap() = Some(Box::new(move || {
+            *flag.lock().unwrap() = true;
+        }));
+
+        // An unrelated cache instance finishing its own unknown-length whole
+        // file must not consume b's hooks.
+        let mut whole_a = a
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, gen_a)
+            .unwrap();
+        whole_a.write(&[1; 10]).await.unwrap();
+        whole_a.finish().await;
+        assert!(
+            b.whole_finish_race.lock().unwrap().is_some(),
+            "a finished on another instance must not steal the finish hook"
+        );
+        assert!(
+            b.whole_commit_race.lock().unwrap().is_some(),
+            "a finished on another instance must not steal the commit hook"
+        );
+        assert!(!*finish_fired.lock().unwrap());
+        assert!(!*commit_fired.lock().unwrap());
+
+        // b's own finish consumes exactly its hooks.
+        let mut whole_b = b
+            .whole_writer(SOURCE.to_owned(), unknown.clone(), None, gen_b)
+            .unwrap();
+        whole_b.write(&[2; 10]).await.unwrap();
+        whole_b.finish().await;
+        assert!(*finish_fired.lock().unwrap());
+        assert!(*commit_fired.lock().unwrap());
     }
 }
